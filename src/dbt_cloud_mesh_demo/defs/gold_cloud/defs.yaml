@@ -1,0 +1,34 @@
+type: dbt_cloud_mesh_demo.components.dbt_cloud_mesh_component.DbtCloudMeshComponent
+
+attributes:
+  workspace:
+    account_id: 12345
+    token: "{{ env.DBT_CLOUD_TOKEN }}"
+    access_url: "https://cloud.getdbt.com"
+    project_id: 100002
+    environment_id: 200002
+
+  op:
+    name: gold_dbt_cloud_assets
+
+  # Don't refresh state from dbt Cloud on dev load (using pre-baked state)
+  defs_state:
+    management_type: LOCAL_FILESYSTEM
+    refresh_if_dev: false
+
+  # Exclude silver_project models from normal dbt asset creation
+  exclude: "package:silver_project"
+
+  # Polling sensor observes dbt Cloud runs triggered outside Dagster.
+  # Set to true when using real dbt Cloud credentials.
+  create_sensor: false
+
+  # Create external assets for silver models referenced via dbt mesh
+  external_packages:
+    silver_project:
+      key_prefix: ["silver_project"]
+      group_name: "silver"
+
+  # Group overrides for gold project models
+  group_overrides:
+    gold: gold

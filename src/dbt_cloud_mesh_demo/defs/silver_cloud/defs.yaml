@@ -1,0 +1,27 @@
+type: dbt_cloud_mesh_demo.components.dbt_cloud_mesh_component.DbtCloudMeshComponent
+
+attributes:
+  workspace:
+    account_id: 12345
+    token: "{{ env.DBT_CLOUD_TOKEN }}"
+    access_url: "https://cloud.getdbt.com"
+    project_id: 100001
+    environment_id: 200001
+
+  op:
+    name: silver_dbt_cloud_assets
+
+  # Don't refresh state from dbt Cloud on dev load (using pre-baked state)
+  defs_state:
+    management_type: LOCAL_FILESYSTEM
+    refresh_if_dev: false
+
+  # Polling sensor observes dbt Cloud runs triggered outside Dagster.
+  # Set to true when using real dbt Cloud credentials.
+  create_sensor: false
+
+  # Group overrides - assign Dagster groups based on dbt fqn path segments
+  group_overrides:
+    seed: raw
+    staging: bronze
+    silver: silver

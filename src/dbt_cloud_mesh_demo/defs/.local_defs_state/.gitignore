@@ -1,0 +1,3 @@
+# Allow mock state files for demo purposes
+!DbtCloudComponent__*/
+!DbtCloudComponent__*/state
