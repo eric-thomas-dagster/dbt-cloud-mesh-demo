@@ -1,10 +1,16 @@
 # dbt Cloud Mesh Demo
 
-Dagster project demonstrating orchestration of two **dbt Cloud** projects that use dbt mesh for cross-project references.
+Dagster project demonstrating orchestration of two **dbt Cloud** projects that use dbt mesh for cross-project references. One project handles bronze-to-silver transformations, the other handles silver-to-gold and references silver models via dbt mesh.
+
+## How dbt Mesh Works with Dagster
+
+When two dbt projects use dbt mesh, the downstream project (gold) pulls in upstream models (silver) via `packages.yml`. This means the gold project's manifest contains **both** gold and silver models. Dagster needs to handle this correctly to avoid duplicate assets while preserving lineage.
+
+The key insight: **`exclude: "package:silver_project"` on the gold component prevents duplicate assets, and the dependency edges from gold models to silver asset keys are preserved.** Dagster resolves those dependencies to the real silver assets regardless of whether they live in the same or different code locations.
 
 ## Single Code Location (Recommended)
 
-If both dbt Cloud projects live in the **same Dagster code location**, you can use the standard `DbtCloudComponent` with no custom code at all:
+If both dbt Cloud projects live in the **same Dagster code location**, use the standard `DbtCloudComponent` with no custom code:
 
 ```yaml
 # silver_cloud/defs.yaml
@@ -33,61 +39,64 @@ attributes:
 
 This works because:
 
-- **Asset keys are globally unique** within a code location. The silver component creates assets for silver models, and the gold component's `exclude` prevents duplicating them.
-- **Cross-project lineage resolves automatically.** Gold models depend on silver asset keys that already exist in the asset graph from the silver component.
-- **The polling sensor just works.** When the gold sensor emits materializations for silver models (included in the run results via dbt packages), those asset keys exist in the code location's asset graph, so the sensor's toposort lookup succeeds.
+- **No duplicate assets.** The silver component creates assets for silver models. The gold component's `exclude` prevents creating them again.
+- **Lineage is preserved.** `exclude` only prevents silver models from becoming assets in the gold component - it does **not** strip the dependency edges. Gold models like `customer_360` still have `deps=[AssetKey(["customers"])]`, which resolves to the silver component's real asset.
+- **The polling sensor just works.** When the gold sensor emits materializations for silver models (included in run results via dbt packages), those asset keys exist in the code location's asset graph from the silver component, so the sensor's toposort lookup succeeds.
 
 No custom component, no external assets, no sensor filtering needed.
 
-## Multi-Code Location Deployments
+## Multi-Code-Location Deployments
 
-If your silver and gold projects are in **separate code locations** (separate Dagster projects or deployments), the standard `DbtCloudComponent` sensor will fail with an error like:
+If your silver and gold projects are in **separate code locations**, lineage still works - Dagster builds a unified asset graph across all code locations in a workspace. Gold's dependency on `AssetKey(["customers"])` resolves to the silver code location's asset automatically.
 
-```
-AssetKey(['silver', 'base_exposure_relationships']) is not in list
-```
-
-This happens because the sensor's `sorted_asset_events` function looks up asset keys in `repository_def.asset_graph`, which is scoped to the **current code location**. Silver assets don't exist in the gold code location's graph.
-
-For this scenario, this project includes a `DbtCloudMeshComponent` that solves the problem.
-
-## Architecture
+However, the **polling sensor will crash** with an error like:
 
 ```
-src/dbt_cloud_mesh_demo/
-  components/
-    dbt_cloud_mesh_component.py   Custom DbtCloudMeshComponent (subclasses DbtCloudComponent)
-  defs/
-    silver_cloud/                 Component instance for the silver dbt Cloud project
-    gold_cloud/                   Component instance for the gold dbt Cloud project
+AssetKey(['evaluator', 'base_exposure_relationships']) is not in list
 ```
 
-### DbtCloudMeshComponent Features
+This happens because the sensor's internal `sorted_asset_events` function sorts materialization events using `repository_def.asset_graph.toposorted_asset_keys`, which is scoped to the **current code location's** asset graph. When the gold dbt Cloud run completes, the run results include silver models. The sensor tries to look up those silver asset keys in the gold code location's toposorted list, and they're not there.
 
-- **`external_packages`**: Creates external asset specs for public models from other dbt projects, preserving cross-project lineage without duplicating assets. Also tells the mesh-aware sensor to skip those models.
-- **`group_overrides`**: Maps dbt resource types or fqn path segments to Dagster groups via YAML, even when the dbt project doesn't define groups. Uses a custom `DagsterDbtTranslator` under the hood.
-- **Mesh-aware sensor**: Replaces the standard polling sensor with one that filters out materialization events for external package models, preventing the "not in list" error in multi-code-location setups.
+### Why This Only Affects dbt Cloud (Not dbt Core)
 
-### How the Mesh-Aware Sensor Works
+With `DbtProjectComponent` (dbt Core), Dagster runs dbt directly via CLI and controls exactly which models execute. The `exclude` filter means silver models are never run, so there are no materialization events to emit for them. With dbt Cloud, runs happen externally and the sensor observes **all** completed run results, including silver models that were part of the run.
 
-In a dbt mesh setup, the gold project's manifest includes models from the silver project (pulled in via `packages.yml`). When a gold dbt Cloud run completes, the run results contain **both** gold and silver models. In a multi-code-location deployment, the silver asset keys don't exist in the gold code location's asset graph.
+### The Fix: DbtCloudMeshComponent
 
-The `DbtCloudMeshComponent` replaces the standard sensor with a mesh-aware sensor that:
+This project includes a `DbtCloudMeshComponent` that solves the sensor problem for multi-code-location deployments by replacing the standard polling sensor with a **mesh-aware sensor** that filters out materialization events for models belonging to external packages.
 
-1. Identifies all node IDs belonging to packages listed in `external_packages`
-2. Filters out materialization events for those nodes before emitting them
-3. Only emits events for models that are actually **owned** by this code location
+```yaml
+# gold_cloud/defs.yaml (multi-code-location)
+type: dbt_cloud_mesh_demo.components.dbt_cloud_mesh_component.DbtCloudMeshComponent
+attributes:
+  workspace:
+    account_id: 12345
+    token: "{{ env.DBT_CLOUD_TOKEN }}"
+    project_id: 100002
+    environment_id: 200002
+  exclude: "package:silver_project"
+  create_sensor: true
+  external_packages:
+    silver_project:
+      key_prefix: ["silver_project"]
+      group_name: "silver"
+```
 
-The silver code location's own sensor handles silver model materializations independently.
+The `external_packages` config tells the mesh-aware sensor which packages to filter. The silver code location's own sensor handles silver model materializations independently.
 
-### How External Assets Work
+### Additional Feature: group_overrides
 
-When the gold dbt project references silver models via `{{ ref('silver_project', 'customers') }}`, those silver models appear in gold's manifest as nodes with `package_name: "silver_project"`. In a multi-code-location setup, the `DbtCloudMeshComponent` handles this with:
+The `DbtCloudMeshComponent` also supports `group_overrides` for assigning Dagster groups from YAML when the dbt project doesn't define them:
 
-1. **`exclude: "package:silver_project"`** - Prevents silver models from being created as regular dbt assets, avoiding duplication with the silver code location.
-2. **`external_packages`** - Generates `AssetSpec` objects for **public** silver models (respecting dbt's `access: public` modifier). These appear as external assets in the gold code location's asset graph, preserving cross-project dependency lineage.
+```yaml
+  group_overrides:
+    seed: raw
+    staging: bronze
+    silver: silver
+    gold: gold
+```
 
-In a single code location, neither of these features is needed - the lineage resolves automatically.
+Matches by resource type first (e.g. `seed`), then by fqn path segment (e.g. `staging`). Falls back to the dbt-defined group if no override matches.
 
 ## Setup for Your dbt Cloud Account
 
