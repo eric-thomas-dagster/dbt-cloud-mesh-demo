@@ -110,3 +110,25 @@ When `create_sensor: true` and real credentials are configured, the `DbtCloudCom
 4. Updates the Dagster asset graph with the latest run metadata
 
 This means when someone runs a dbt Cloud job via the dbt Cloud UI, CI/CD, or the dbt Cloud scheduler, Dagster automatically picks up the results and reflects them in the asset catalog.
+
+### Mesh-Aware Sensor Filtering
+
+In a dbt mesh setup, the gold project's manifest includes models from the silver project (pulled in via `packages.yml`). When a gold dbt Cloud run completes, the run results contain **both** gold and silver models. The standard `DbtCloudComponent` polling sensor would try to emit materialization events for all of them, but the silver models are excluded from the gold component's assets (via `exclude: "package:silver_project"`), causing an "asset key not in list" error.
+
+The `DbtCloudMeshComponent` solves this by replacing the standard sensor with a **mesh-aware sensor** that:
+
+1. Identifies all node IDs belonging to packages listed in `external_packages`
+2. Filters out materialization events for those nodes before emitting them
+3. Only emits events for models that are actually **owned** by this component
+
+This ensures the gold project's sensor only reports on gold models, while the silver project's sensor (in `silver_cloud`) handles its own models independently.
+
+## How External Assets Work
+
+When the gold dbt project references silver models via `{{ ref('silver_project', 'customers') }}`, those silver models appear in gold's dbt manifest as nodes with `package_name: "silver_project"`. The `DbtCloudMeshComponent` handles this in two ways:
+
+1. **Exclude from normal assets** (`exclude: "package:silver_project"`) - Prevents silver models from being created as regular dbt assets in the gold component, avoiding duplication with the silver component.
+
+2. **Create external asset specs** (`external_packages`) - Generates `AssetSpec` objects for **public** silver models (respecting dbt's `access: public` modifier). These appear in the Dagster asset graph as unmanaged external assets, preserving the cross-project dependency lineage. Gold models like `customer_360` correctly show they depend on `silver_project/customers`.
+
+This combination means each model exists as a single asset in Dagster's catalog, with proper lineage across project boundaries.
