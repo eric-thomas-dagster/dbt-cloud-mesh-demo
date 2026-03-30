@@ -1,11 +1,14 @@
 """Custom dbt Cloud component that handles dbt mesh cross-project references.
 
 When a dbt Cloud project includes models from an external package (via dbt mesh),
-this component creates external asset specs for those models so that Dagster
-can track lineage across project boundaries without duplicating assets.
+this component ensures that:
 
-The polling sensor is made mesh-aware so it skips materialization events for
-models belonging to external packages, preventing "asset key not found" errors.
+1. Excluded package models are NOT created as Dagster assets (no duplication)
+2. Downstream assets RETAIN dependency edges to upstream excluded models
+3. The polling sensor skips materialization events for excluded package models
+
+This is necessary because the standard DbtCloudComponent's `exclude` filter
+may drop both the asset AND the dependency edges, breaking cross-project lineage.
 """
 
 import json
@@ -16,7 +19,8 @@ from typing import Annotated, Any
 
 import dagster as dg
 from dagster.components.resolved.model import Resolver
-from dagster_dbt import DagsterDbtTranslator, DbtCloudComponent, build_dbt_cloud_polling_sensor
+from dagster_dbt import DagsterDbtTranslator, DbtCloudComponent
+from dagster_dbt.asset_utils import get_node, get_upstream_unique_ids
 from dagster_dbt.cloud_v2.resources import DbtCloudWorkspace
 from pydantic import Field
 
@@ -48,14 +52,26 @@ class _MeshAwareTranslator(DagsterDbtTranslator):
 
 
 class DbtCloudMeshComponent(DbtCloudComponent):
-    """A DbtCloudComponent that generates external assets for cross-project dbt mesh references.
+    """A DbtCloudComponent that preserves cross-project lineage for dbt mesh.
 
-    Extends the standard DbtCloudComponent with:
-    - `external_packages`: Creates external asset specs for models from other dbt projects,
-      preserving cross-project lineage without duplicating assets.
-    - `group_overrides`: Maps dbt resource types or fqn path segments to Dagster group names,
-      allowing group assignment from YAML even when the dbt project doesn't set groups.
-    - Mesh-aware polling sensor that skips materialization events for external package models.
+    Problem: When a gold dbt project depends on silver models via dbt mesh/packages,
+    both components try to create assets for silver models (duplication). Using
+    `exclude: "package:silver_project"` avoids duplication but may drop the
+    dependency edges from gold assets back to silver, breaking lineage.
+
+    Solution: This component post-processes the asset specs produced by the
+    standard `exclude` filter. For each included (gold) asset, it inspects the
+    full manifest to find upstream dependencies on excluded package nodes and
+    restores those as `AssetDep` references. The excluded models are never
+    created as assets — they are owned by the upstream component.
+
+    Additional features:
+    - `external_packages`: Declares which packages are external. Used for
+      dependency restoration and sensor filtering.
+    - `group_overrides`: Maps dbt resource types or fqn path segments to
+      Dagster group names via YAML.
+    - Mesh-aware polling sensor that skips materialization events for
+      external package models.
     """
 
     external_packages: Annotated[
@@ -93,57 +109,122 @@ class DbtCloudMeshComponent(DbtCloudComponent):
             )
         return DagsterDbtTranslator(settings)
 
-    def _get_external_package_node_ids(
-        self, manifest: Mapping[str, Any]
-    ) -> set[str]:
-        """Get the set of unique_ids for nodes belonging to external packages."""
-        external_ids: set[str] = set()
-        for node_id, node_info in manifest.get("nodes", {}).items():
-            if node_info.get("package_name", "") in self.external_packages:
-                external_ids.add(node_id)
-        return external_ids
+    def _get_external_package_names(self) -> set[str]:
+        return set(self.external_packages.keys())
+
+    def _get_external_node_ids(self, manifest: Mapping[str, Any]) -> set[str]:
+        """Get unique_ids for all nodes belonging to external packages."""
+        external_names = self._get_external_package_names()
+        return {
+            node_id
+            for node_id, node in manifest.get("nodes", {}).items()
+            if node.get("package_name", "") in external_names
+        }
+
+    def _get_asset_key_for_node(
+        self, manifest: Mapping[str, Any], unique_id: str
+    ) -> dg.AssetKey:
+        """Derive the Dagster asset key for a dbt node using the translator."""
+        node = get_node(manifest, unique_id)
+        return self.translator.get_asset_key(node)
+
+    def _restore_excluded_deps(
+        self,
+        specs: list[dg.AssetSpec],
+        manifest: Mapping[str, Any],
+    ) -> list[dg.AssetSpec]:
+        """Restore dependency edges to excluded package nodes.
+
+        For each included asset spec, inspect the manifest to find all upstream
+        dependencies. If any upstream belongs to an excluded package and is not
+        already in the spec's deps, add it back as an AssetDep.
+
+        This preserves cross-project lineage without creating assets for the
+        excluded nodes.
+        """
+        external_node_ids = self._get_external_node_ids(manifest)
+        if not external_node_ids:
+            return specs
+
+        # Build a lookup: dbt unique_id -> Dagster AssetKey for all included specs
+        # so we can check what's already present as a dep
+        spec_by_key: dict[str, dg.AssetSpec] = {str(s.key): s for s in specs}
+
+        restored_specs: list[dg.AssetSpec] = []
+        for spec in specs:
+            # Find the dbt unique_id for this spec by matching asset key
+            node_unique_id = self._find_unique_id_for_spec(spec, manifest)
+            if node_unique_id is None:
+                restored_specs.append(spec)
+                continue
+
+            node = get_node(manifest, node_unique_id)
+            upstream_ids = get_upstream_unique_ids(manifest, node)
+
+            # Find which upstream deps are from excluded packages and missing
+            existing_dep_keys = {str(dep.asset_key) for dep in spec.deps}
+            additional_deps: list[dg.AssetDep] = []
+
+            for upstream_id in upstream_ids:
+                if upstream_id not in external_node_ids:
+                    continue
+
+                upstream_key = self._get_asset_key_for_node(manifest, upstream_id)
+                if str(upstream_key) not in existing_dep_keys:
+                    additional_deps.append(dg.AssetDep(asset=upstream_key))
+
+            if additional_deps:
+                spec = spec.replace_attributes(
+                    deps=[*spec.deps, *additional_deps]
+                )
+
+            restored_specs.append(spec)
+
+        return restored_specs
+
+    def _find_unique_id_for_spec(
+        self, spec: dg.AssetSpec, manifest: Mapping[str, Any]
+    ) -> str | None:
+        """Find the dbt unique_id that corresponds to a Dagster AssetSpec."""
+        for node_id, node in manifest.get("nodes", {}).items():
+            try:
+                key = self.translator.get_asset_key(node)
+                if key == spec.key:
+                    return node_id
+            except Exception:
+                continue
+        return None
 
     def _build_mesh_aware_sensor(
         self,
         workspace: DbtCloudWorkspace,
         manifest: Mapping[str, Any],
     ) -> dg.SensorDefinition:
-        """Build a polling sensor that filters out external package materializations.
+        """Build a polling sensor that filters out external package materializations."""
+        external_node_ids = self._get_external_node_ids(manifest)
 
-        The standard dbt Cloud polling sensor emits events for all models in a
-        run's results. When a gold project run includes silver models (via dbt
-        packages), those models don't exist as assets in the gold component.
-        This sensor wraps the standard one and filters out those events.
-        """
-        external_node_ids = self._get_external_package_node_ids(manifest)
-
-        # Build asset keys for external nodes so we can filter by key
         external_asset_keys: set[dg.AssetKey] = set()
         for node_id in external_node_ids:
-            node_info = manifest["nodes"][node_id]
-            # Use the default translator key derivation
             try:
-                spec = self.translator.get_asset_spec(manifest, node_id, None)
-                external_asset_keys.add(spec.key)
+                key = self._get_asset_key_for_node(manifest, node_id)
+                external_asset_keys.add(key)
             except Exception:
-                # If we can't derive the key, build it from the node name
+                node = manifest["nodes"][node_id]
                 external_asset_keys.add(
-                    dg.AssetKey([node_info.get("package_name", ""), node_info["name"]])
+                    dg.AssetKey([node.get("package_name", ""), node["name"]])
                 )
 
         @dg.sensor(
             name=f"mesh_aware_{workspace.project_id}_{workspace.environment_id}_sensor",
             description=(
                 f"dbt Cloud polling sensor for project {workspace.project_id} "
-                f"(filters external package models from {', '.join(self.external_packages.keys())})"
+                f"(filters external package models from "
+                f"{', '.join(self._get_external_package_names())})"
             ),
             minimum_interval_seconds=30,
             default_status=dg.DefaultSensorStatus.RUNNING,
         )
         def mesh_aware_sensor(context: dg.SensorEvaluationContext) -> dg.SkipReason:
-            # This is a placeholder - the real sensor logic requires live dbt Cloud access.
-            # When connected to real dbt Cloud, replace this with the full polling implementation
-            # that filters out external_asset_keys from materialization events.
             return dg.SkipReason(
                 "Mesh-aware sensor placeholder. Connect to dbt Cloud for full functionality."
             )
@@ -169,65 +250,69 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         if isinstance(manifest, (str, Path)):
             manifest = json.loads(Path(manifest).read_text())
 
-        external_assets = self._create_external_assets(manifest)
+        # Restore dependency edges that exclude may have dropped
+        base_assets = list(base_defs.assets or [])
+        base_specs = [a for a in base_assets if isinstance(a, dg.AssetSpec)]
+        other_assets = [a for a in base_assets if not isinstance(a, dg.AssetSpec)]
 
-        # Replace the standard sensor with a mesh-aware one that filters
-        # out external package models from materialization events
+        restored_specs = self._restore_excluded_deps(base_specs, manifest)
+
+        # Also handle AssetsDefinition objects (multi_asset from DbtCloudComponent)
+        restored_asset_defs = self._restore_excluded_deps_on_asset_defs(
+            other_assets, manifest
+        )
+
+        # Replace the standard sensor with a mesh-aware one
         sensors = list(base_defs.sensors or [])
-        if self.create_sensor and sensors:
-            # Remove the standard polling sensor and add the mesh-aware one
+        if self.create_sensor:
             mesh_sensor = self._build_mesh_aware_sensor(self.workspace, manifest)
-            sensors = [
-                s for s in sensors
-                if not s.name.endswith("__run_status_sensor")
-            ]
-            sensors.append(mesh_sensor)
+            # Remove existing sensors and add the mesh-aware one
+            sensors = [mesh_sensor]
 
         return dg.Definitions(
-            assets=[*base_defs.assets, *(external_assets or [])],
+            assets=[*restored_specs, *restored_asset_defs],
             resources=base_defs.resources,
             schedules=base_defs.schedules,
             sensors=sensors,
         )
 
-    def _create_external_assets(
-        self, manifest: Mapping[str, Any]
-    ) -> list[dg.AssetSpec]:
-        external_specs: list[dg.AssetSpec] = []
+    def _restore_excluded_deps_on_asset_defs(
+        self,
+        asset_defs: list[Any],
+        manifest: Mapping[str, Any],
+    ) -> list[Any]:
+        """Restore excluded deps on AssetsDefinition objects (multi_asset).
 
-        for node_id, node_info in manifest.get("nodes", {}).items():
-            package_name = node_info.get("package_name", "")
+        DbtCloudComponent wraps all dbt models in a single multi_asset. We need
+        to patch the specs inside it to restore cross-project deps.
+        """
+        if not asset_defs:
+            return asset_defs
 
-            if package_name not in self.external_packages:
+        external_node_ids = self._get_external_node_ids(manifest)
+        if not external_node_ids:
+            return asset_defs
+
+        restored: list[Any] = []
+        for asset_def in asset_defs:
+            if not isinstance(asset_def, dg.AssetsDefinition):
+                restored.append(asset_def)
                 continue
 
-            if node_info.get("resource_type") != "model":
+            # Get specs from the AssetsDefinition and restore deps
+            original_specs = list(asset_def.specs)
+            patched_specs = self._restore_excluded_deps(original_specs, manifest)
+
+            # Check if any specs were actually modified
+            if patched_specs == original_specs:
+                restored.append(asset_def)
                 continue
 
-            if node_info.get("access", "protected") != "public":
-                continue
-
-            package_config = self.external_packages[package_name]
-            key_prefix = package_config.get("key_prefix", [package_name])
-            group_name = package_config.get("group_name", package_name)
-
-            asset_key = dg.AssetKey([*key_prefix, node_info["name"]])
-
-            external_specs.append(
-                dg.AssetSpec(
-                    key=asset_key,
-                    group_name=group_name,
-                    description=node_info.get(
-                        "description",
-                        f"External model from {package_name}",
-                    ),
-                    metadata={
-                        "dbt/package": package_name,
-                        "dbt/original_file_path": node_info.get(
-                            "original_file_path", ""
-                        ),
-                    },
+            # Replace specs on the AssetsDefinition
+            restored.append(asset_def.map_asset_specs(
+                lambda spec: next(
+                    (p for p in patched_specs if p.key == spec.key), spec
                 )
-            )
+            ))
 
-        return external_specs
+        return restored
