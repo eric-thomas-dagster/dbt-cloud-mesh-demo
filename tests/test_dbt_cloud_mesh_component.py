@@ -77,7 +77,6 @@ class TestExcludedPackageAssetsNotCreated:
         """_restore_excluded_deps should not add new specs for excluded nodes."""
         component = DbtCloudMeshComponent(
             workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
-            external_packages={"silver_project": {"key_prefix": ["silver_project"]}},
             exclude="package:silver_project",
         )
 
@@ -106,7 +105,6 @@ class TestLineagePreserved:
         """After _restore_excluded_deps, gold specs must have deps on silver keys."""
         component = DbtCloudMeshComponent(
             workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
-            external_packages={"silver_project": {"key_prefix": ["silver_project"]}},
             exclude="package:silver_project",
         )
 
@@ -145,7 +143,6 @@ class TestLineagePreserved:
         """If deps already exist (exclude preserved them), they should not be added twice."""
         component = DbtCloudMeshComponent(
             workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
-            external_packages={"silver_project": {}},
             exclude="package:silver_project",
         )
 
@@ -175,6 +172,73 @@ class TestLineagePreserved:
             )
 
 
+class TestExcludeOnlyWithoutExternalPackages:
+    """Dep restoration must work with only `exclude` set, no `external_packages` needed."""
+
+    def test_exclude_only_parses_package_name(self):
+        """The component should detect excluded packages from the exclude string."""
+        component = DbtCloudMeshComponent(
+            workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
+            exclude="package:silver_project",
+        )
+        assert "silver_project" in component._get_excluded_package_names()
+
+    def test_exclude_multiple_packages(self):
+        """Multiple package:X patterns should all be detected."""
+        component = DbtCloudMeshComponent(
+            workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
+            exclude="package:silver_project package:bronze_project",
+        )
+        names = component._get_excluded_package_names()
+        assert "silver_project" in names
+        assert "bronze_project" in names
+
+    def test_exclude_combined_with_external_packages(self):
+        """external_packages and exclude should merge, not conflict."""
+        component = DbtCloudMeshComponent(
+            workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
+            exclude="package:silver_project",
+            external_packages={"other_project": {}},
+        )
+        names = component._get_excluded_package_names()
+        assert "silver_project" in names
+        assert "other_project" in names
+
+    def test_deps_restored_without_external_packages(self):
+        """Deps should be restored using only exclude, no external_packages."""
+        component = DbtCloudMeshComponent(
+            workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
+            exclude="package:silver_project",
+            # NOTE: no external_packages set
+        )
+
+        gold_specs = [
+            dg.AssetSpec(key=TRANSLATOR.get_asset_key(MANIFEST["nodes"][uid]))
+            for uid in _gold_node_ids()
+        ]
+        restored = component._restore_excluded_deps(gold_specs, MANIFEST)
+
+        # Gold specs should have deps on silver
+        for spec in restored:
+            uid = next(
+                (u for u in _gold_node_ids()
+                 if TRANSLATOR.get_asset_key(MANIFEST["nodes"][u]) == spec.key),
+                None,
+            )
+            if uid is None:
+                continue
+            node = MANIFEST["nodes"][uid]
+            upstream_ids = get_upstream_unique_ids(MANIFEST, node)
+            silver_upstream = upstream_ids & _silver_node_ids()
+            if silver_upstream:
+                dep_keys = {str(d.asset_key) for d in spec.deps}
+                for s_uid in silver_upstream:
+                    expected = TRANSLATOR.get_asset_key(MANIFEST["nodes"][s_uid])
+                    assert str(expected) in dep_keys, (
+                        f"{spec.key} missing dep on {expected}"
+                    )
+
+
 class TestNoDuplicateOwnership:
     """External packages must not reintroduce duplicate asset ownership."""
 
@@ -182,7 +246,6 @@ class TestNoDuplicateOwnership:
         """The component should never output AssetSpecs for silver models."""
         component = DbtCloudMeshComponent(
             workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
-            external_packages={"silver_project": {}},
             exclude="package:silver_project",
         )
 
@@ -208,7 +271,6 @@ class TestNoDuplicateOwnership:
         """Every manifest-level cross-project dep must be represented."""
         component = DbtCloudMeshComponent(
             workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
-            external_packages={"silver_project": {}},
             exclude="package:silver_project",
         )
 

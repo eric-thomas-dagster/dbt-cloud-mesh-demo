@@ -59,26 +59,28 @@ class DbtCloudMeshComponent(DbtCloudComponent):
     `exclude: "package:silver_project"` avoids duplication but may drop the
     dependency edges from gold assets back to silver, breaking lineage.
 
-    Solution: This component post-processes the asset specs produced by the
-    standard `exclude` filter. For each included (gold) asset, it inspects the
-    full manifest to find upstream dependencies on excluded package nodes and
-    restores those as `AssetDep` references. The excluded models are never
-    created as assets — they are owned by the upstream component.
+    Solution: This component automatically detects excluded packages from the
+    `exclude` attribute (e.g. `exclude: "package:silver_project"`) and
+    post-processes asset specs to restore upstream dependency edges. The excluded
+    models are never created as assets — they are owned by the upstream component.
 
     Additional features:
-    - `external_packages`: Declares which packages are external. Used for
-      dependency restoration and sensor filtering.
+    - `external_packages`: Optional. Provides extra config for sensor filtering
+      (key_prefix, group_name). Not required for dep restoration — that happens
+      automatically based on `exclude`.
     - `group_overrides`: Maps dbt resource types or fqn path segments to
       Dagster group names via YAML.
     - Mesh-aware polling sensor that skips materialization events for
-      external package models.
+      excluded package models.
     """
 
     external_packages: Annotated[
         dict[str, dict[str, Any]],
         Resolver.default(
             description=(
-                "Map of external package names to their config. "
+                "Optional map of external package names to their config. "
+                "Used for sensor filtering and group naming. Not required for "
+                "dependency restoration — that is automatic based on `exclude`. "
                 "Each entry supports 'key_prefix' (list[str]) and 'group_name' (str)."
             ),
         ),
@@ -109,16 +111,29 @@ class DbtCloudMeshComponent(DbtCloudComponent):
             )
         return DagsterDbtTranslator(settings)
 
-    def _get_external_package_names(self) -> set[str]:
-        return set(self.external_packages.keys())
+    def _get_excluded_package_names(self) -> set[str]:
+        """Derive excluded package names from the `exclude` attribute and `external_packages`.
 
-    def _get_external_node_ids(self, manifest: Mapping[str, Any]) -> set[str]:
-        """Get unique_ids for all nodes belonging to external packages."""
-        external_names = self._get_external_package_names()
+        Parses `exclude: "package:silver_project"` to extract "silver_project".
+        Also includes any packages explicitly listed in `external_packages`.
+        """
+        packages: set[str] = set(self.external_packages.keys())
+
+        # Parse "package:X" patterns from the exclude string
+        if self.exclude:
+            for part in self.exclude.split():
+                if part.startswith("package:"):
+                    packages.add(part[len("package:"):])
+
+        return packages
+
+    def _get_excluded_node_ids(self, manifest: Mapping[str, Any]) -> set[str]:
+        """Get unique_ids for all nodes belonging to excluded packages."""
+        excluded_names = self._get_excluded_package_names()
         return {
             node_id
             for node_id, node in manifest.get("nodes", {}).items()
-            if node.get("package_name", "") in external_names
+            if node.get("package_name", "") in excluded_names
         }
 
     def _get_asset_key_for_node(
@@ -142,7 +157,7 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         This preserves cross-project lineage without creating assets for the
         excluded nodes.
         """
-        external_node_ids = self._get_external_node_ids(manifest)
+        external_node_ids = self._get_excluded_node_ids(manifest)
         if not external_node_ids:
             return specs
 
@@ -201,7 +216,7 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         manifest: Mapping[str, Any],
     ) -> dg.SensorDefinition:
         """Build a polling sensor that filters out external package materializations."""
-        external_node_ids = self._get_external_node_ids(manifest)
+        external_node_ids = self._get_excluded_node_ids(manifest)
 
         external_asset_keys: set[dg.AssetKey] = set()
         for node_id in external_node_ids:
@@ -219,7 +234,7 @@ class DbtCloudMeshComponent(DbtCloudComponent):
             description=(
                 f"dbt Cloud polling sensor for project {workspace.project_id} "
                 f"(filters external package models from "
-                f"{', '.join(self._get_external_package_names())})"
+                f"{', '.join(self._get_excluded_package_names())})"
             ),
             minimum_interval_seconds=30,
             default_status=dg.DefaultSensorStatus.RUNNING,
@@ -236,7 +251,8 @@ class DbtCloudMeshComponent(DbtCloudComponent):
     ) -> dg.Definitions:
         base_defs = super().build_defs_from_state(context, state_path)
 
-        if not self.external_packages or state_path is None:
+        excluded_packages = self._get_excluded_package_names()
+        if not excluded_packages or state_path is None:
             return base_defs
 
         from dagster._serdes import deserialize_value
@@ -289,7 +305,7 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         if not asset_defs:
             return asset_defs
 
-        external_node_ids = self._get_external_node_ids(manifest)
+        external_node_ids = self._get_excluded_node_ids(manifest)
         if not external_node_ids:
             return asset_defs
 
