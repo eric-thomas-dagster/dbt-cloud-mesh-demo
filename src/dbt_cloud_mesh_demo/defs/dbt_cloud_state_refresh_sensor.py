@@ -7,19 +7,25 @@ to detect actual structural changes, and triggers:
   1. `dg plus deploy refresh-defs-state` to update the cached state
   2. A GraphQL `reloadRepositoryLocation` mutation to reload the code location
 
-Required environment variables (for dbt Cloud API access):
-  DBT_CLOUD_ACCOUNT_ID  - dbt Cloud account ID
-  DBT_CLOUD_TOKEN       - dbt Cloud API token (shared with workspace components)
-  DBT_CLOUD_ACCESS_URL  - dbt Cloud access URL (default: https://cloud.getdbt.com)
+Required environment variables:
+  DBT_CLOUD_ACCOUNT_ID      - dbt Cloud account ID
+  DBT_CLOUD_TOKEN           - dbt Cloud API token (shared with workspace components)
+  DAGSTER_CLOUD_API_TOKEN   - Dagster Cloud API token (for refresh + reload).
+                              Must be set as a secret in your Dagster Cloud deployment.
+                              NOT auto-provided — generate one at your org's Settings > Tokens.
 
-Dagster Cloud automatically provides:
+  Per-workspace IDs (configure in WORKSPACES list below):
+    DBT_CLOUD_SILVER_PROJECT_ID / DBT_CLOUD_SILVER_ENVIRONMENT_ID
+    DBT_CLOUD_GOLD_PROJECT_ID   / DBT_CLOUD_GOLD_ENVIRONMENT_ID
+
+Auto-provided by Dagster Cloud (no action needed):
   DAGSTER_CLOUD_DEPLOYMENT_NAME - current deployment name
   DAGSTER_CLOUD_ORGANIZATION    - organization name
   DAGSTER_CLOUD_URL             - Dagster Cloud API base URL
-  DAGSTER_CLOUD_API_TOKEN       - API token (if set for the agent)
   DAGSTER_CLOUD_LOCATION_NAME   - code location name (for reload)
 
-Workspace project/environment IDs are configured in the WORKSPACES list below.
+Optional:
+  DBT_CLOUD_ACCESS_URL - dbt Cloud access URL (default: https://cloud.getdbt.com)
 """
 
 import hashlib

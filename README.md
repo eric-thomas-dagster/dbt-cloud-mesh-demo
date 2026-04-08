@@ -205,20 +205,25 @@ Routine runs that don't alter the project structure are ignored -- no unnecessar
 
 ### Setup
 
-Dagster Cloud automatically provides `DAGSTER_CLOUD_DEPLOYMENT_NAME` and `DAGSTER_CLOUD_ORGANIZATION` -- the `dg plus deploy refresh-defs-state` CLI reads both from the environment, so no extra configuration is needed for the refresh command.
-
-Set the dbt Cloud environment variables (shared with workspace components):
+Set these environment variables in your Dagster Cloud deployment (as secrets where appropriate):
 
 ```bash
-export DBT_CLOUD_ACCOUNT_ID="12345"
-export DBT_CLOUD_TOKEN="your-token"
+# dbt Cloud API access (shared with workspace components)
+DBT_CLOUD_ACCOUNT_ID="12345"
+DBT_CLOUD_TOKEN="your-dbt-cloud-token"
+
+# Dagster Cloud API token — required for state refresh and code location reload.
+# NOT auto-provided. Generate at Settings > Tokens in your Dagster Cloud org.
+DAGSTER_CLOUD_API_TOKEN="user:your-dagster-cloud-token"
 
 # Per-workspace project/environment IDs
-export DBT_CLOUD_SILVER_PROJECT_ID="100001"
-export DBT_CLOUD_SILVER_ENVIRONMENT_ID="200001"
-export DBT_CLOUD_GOLD_PROJECT_ID="100002"
-export DBT_CLOUD_GOLD_ENVIRONMENT_ID="200002"
+DBT_CLOUD_SILVER_PROJECT_ID="100001"
+DBT_CLOUD_SILVER_ENVIRONMENT_ID="200001"
+DBT_CLOUD_GOLD_PROJECT_ID="100002"
+DBT_CLOUD_GOLD_ENVIRONMENT_ID="200002"
 ```
+
+Dagster Cloud auto-provides `DAGSTER_CLOUD_DEPLOYMENT_NAME`, `DAGSTER_CLOUD_ORGANIZATION`, `DAGSTER_CLOUD_URL`, and `DAGSTER_CLOUD_LOCATION_NAME` -- no action needed for those.
 
 Edit the `WORKSPACES` list in `defs/dbt_cloud_state_refresh_sensor.py` to match your workspace env var names.
 
