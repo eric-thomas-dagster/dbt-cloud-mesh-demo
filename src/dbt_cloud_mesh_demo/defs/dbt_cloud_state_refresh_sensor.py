@@ -2,9 +2,10 @@
 
 When dbt Cloud projects change (new models, modified SQL, schema changes),
 Dagster's cached definitions state becomes stale. This sensor polls dbt Cloud
-for new successful runs, compares the manifest fingerprint (node IDs + checksums)
-to detect actual project structure changes, and triggers a targeted
-`dg plus deploy refresh-defs-state` for only the affected workspace.
+for new successful runs, compares manifest fingerprints (node IDs + checksums)
+to detect actual structural changes, and triggers:
+  1. `dg plus deploy refresh-defs-state` to update the cached state
+  2. A GraphQL `reloadRepositoryLocation` mutation to reload the code location
 
 Required environment variables (for dbt Cloud API access):
   DBT_CLOUD_ACCOUNT_ID  - dbt Cloud account ID
@@ -12,11 +13,11 @@ Required environment variables (for dbt Cloud API access):
   DBT_CLOUD_ACCESS_URL  - dbt Cloud access URL (default: https://cloud.getdbt.com)
 
 Dagster Cloud automatically provides:
-  DAGSTER_CLOUD_DEPLOYMENT_NAME  - current deployment name
-  DAGSTER_CLOUD_ORGANIZATION     - organization name
-
-The `dg plus deploy refresh-defs-state` CLI picks up both automatically,
-so no extra configuration is needed when running in Dagster Cloud.
+  DAGSTER_CLOUD_DEPLOYMENT_NAME - current deployment name
+  DAGSTER_CLOUD_ORGANIZATION    - organization name
+  DAGSTER_CLOUD_URL             - Dagster Cloud API base URL
+  DAGSTER_CLOUD_API_TOKEN       - API token (if set for the agent)
+  DAGSTER_CLOUD_LOCATION_NAME   - code location name (for reload)
 
 Workspace project/environment IDs are configured in the WORKSPACES list below.
 """
@@ -31,9 +32,6 @@ import dagster as dg
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Each entry is a dbt Cloud workspace to monitor for project structure changes.
-# - project_id / environment_id: the actual IDs (ints), or env var names (str)
-# - defs_state_key: matches the pattern DbtCloudComponent[{project_id}-{environment_id}]
-#   used by DbtCloudComponent.defs_state_config. Override if you customized it.
 
 WORKSPACES: list[dict[str, Any]] = [
     {
@@ -132,40 +130,165 @@ def _get_defs_state_key(project_id: int, environment_id: int) -> str:
     return f"DbtCloudComponent[{project_id}-{environment_id}]"
 
 
-def _trigger_targeted_refresh(
+def _trigger_refresh(
     context: dg.SensorEvaluationContext,
     defs_state_key: str,
 ) -> bool:
-    """Run dg plus deploy refresh-defs-state for a specific component.
+    """Refresh definitions state via Dagster Cloud.
 
-    In Dagster Cloud, the CLI automatically reads DAGSTER_CLOUD_DEPLOYMENT_NAME
-    and DAGSTER_CLOUD_ORGANIZATION from the environment.
+    Uses `dg plus deploy refresh-defs-state` which pushes updated state to
+    Dagster Cloud's versioned storage. The --organization and --deployment
+    flags must be on the parent `deploy` command.
+
+    Note: `--defs-state-key` is available on `dg utils refresh-defs-state`
+    (local only) but not yet on `dg plus deploy refresh-defs-state` (cloud).
+    Once it's added, we can target individual components instead of refreshing
+    all state-backed components.
     """
-    cmd = [
-        "dg", "plus", "deploy", "refresh-defs-state",
-        "--defs-state-key", defs_state_key,
-    ]
+    import os
 
-    context.log.info(f"Triggering targeted refresh: {' '.join(cmd)}")
+    cmd = ["dg", "plus", "deploy"]
+
+    # --organization and --deployment are flags on the parent `deploy` command
+    org = os.getenv("DAGSTER_CLOUD_ORGANIZATION")
+    deployment = os.getenv("DAGSTER_CLOUD_DEPLOYMENT_NAME")
+    if org:
+        cmd.extend(["--organization", org])
+    if deployment:
+        cmd.extend(["--deployment", deployment])
+
+    cmd.append("refresh-defs-state")
+
+    # Try targeted refresh if --defs-state-key is supported (future versions)
+    targeted_cmd = [*cmd, "--defs-state-key", defs_state_key]
+    context.log.info(f"Attempting targeted refresh: {' '.join(targeted_cmd)}")
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(targeted_cmd, capture_output=True, text=True, timeout=180)
         if result.returncode == 0:
+            context.log.info(f"Targeted refresh succeeded for {defs_state_key}.")
+            return True
+        elif "no such option" in result.stderr.lower():
             context.log.info(
-                f"Refresh completed for {defs_state_key}.\n{result.stdout}"
+                "--defs-state-key not yet supported on cloud command. "
+                "Falling back to full refresh."
+            )
+        else:
+            context.log.error(
+                f"Targeted refresh failed (exit {result.returncode}): {result.stderr}"
+            )
+            return False
+    except subprocess.TimeoutExpired:
+        context.log.error("Targeted refresh timed out.")
+        return False
+    except FileNotFoundError:
+        context.log.error("'dg' CLI not found. Is dagster-dg-cli installed?")
+        return False
+
+    # Fall back to refreshing all state-backed components
+    context.log.info(f"Running full refresh: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode == 0:
+            context.log.info(f"Full refresh succeeded.\n{result.stdout}")
+            return True
+        else:
+            context.log.error(
+                f"Full refresh failed (exit {result.returncode}): {result.stderr}"
+            )
+            return False
+    except subprocess.TimeoutExpired:
+        context.log.error("Full refresh timed out.")
+        return False
+
+
+def _reload_code_location(context: dg.SensorEvaluationContext) -> bool:
+    """Reload the code location via the Dagster Cloud GraphQL API.
+
+    After refresh-defs-state updates the cached manifest, the running code
+    location still has the old definitions in memory. This mutation triggers
+    a reload so it picks up the new state.
+    """
+    import os
+
+    import requests
+
+    cloud_url = os.getenv("DAGSTER_CLOUD_URL")
+    deployment = os.getenv("DAGSTER_CLOUD_DEPLOYMENT_NAME")
+    api_token = os.getenv("DAGSTER_CLOUD_API_TOKEN")
+    location_name = os.getenv("DAGSTER_CLOUD_LOCATION_NAME")
+
+    if not all([cloud_url, deployment, api_token, location_name]):
+        missing = [
+            name for name, val in {
+                "DAGSTER_CLOUD_URL": cloud_url,
+                "DAGSTER_CLOUD_DEPLOYMENT_NAME": deployment,
+                "DAGSTER_CLOUD_API_TOKEN": api_token,
+                "DAGSTER_CLOUD_LOCATION_NAME": location_name,
+            }.items() if not val
+        ]
+        context.log.warning(
+            f"Cannot reload code location — missing env vars: {', '.join(missing)}. "
+            f"The code location may need to be reloaded manually."
+        )
+        return False
+
+    graphql_url = f"{cloud_url}/{deployment}/graphql"
+
+    mutation = """
+    mutation ReloadRepositoryLocation($repositoryLocationName: String!) {
+        reloadRepositoryLocation(repositoryLocationName: $repositoryLocationName) {
+            __typename
+            ... on WorkspaceLocationEntry {
+                name
+                loadStatus
+            }
+            ... on ReloadNotSupported {
+                message
+            }
+            ... on RepositoryLocationNotFound {
+                message
+            }
+        }
+    }
+    """
+
+    context.log.info(f"Reloading code location '{location_name}' via {graphql_url}")
+
+    try:
+        response = requests.post(
+            graphql_url,
+            json={
+                "query": mutation,
+                "variables": {"repositoryLocationName": location_name},
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Dagster-Cloud-Api-Token": api_token,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        result = data.get("data", {}).get("reloadRepositoryLocation", {})
+        typename = result.get("__typename", "")
+
+        if typename == "WorkspaceLocationEntry":
+            context.log.info(
+                f"Code location '{location_name}' reload initiated "
+                f"(status: {result.get('loadStatus')})."
             )
             return True
         else:
             context.log.error(
-                f"Refresh failed for {defs_state_key} "
-                f"(exit {result.returncode}): {result.stderr}"
+                f"Code location reload returned {typename}: "
+                f"{result.get('message', data)}"
             )
             return False
-    except subprocess.TimeoutExpired:
-        context.log.error(f"Refresh timed out for {defs_state_key}.")
-        return False
-    except FileNotFoundError:
-        context.log.error("'dg' CLI not found. Is dagster-dg-cli installed?")
+
+    except Exception as e:
+        context.log.error(f"Code location reload failed: {e}")
         return False
 
 
@@ -178,9 +301,8 @@ def _trigger_targeted_refresh(
         "Monitors dbt Cloud workspaces for project structure changes (new models, "
         "modified SQL, schema updates). Compares manifest fingerprints to detect "
         "real changes — routine runs that don't alter the project are ignored. "
-        "When a change is detected, triggers a targeted "
-        "`dg plus deploy refresh-defs-state --defs-state-key ...` for only the "
-        "affected workspace."
+        "When a change is detected, refreshes the definitions state and reloads "
+        "the code location."
     ),
     minimum_interval_seconds=POLL_INTERVAL_SECONDS,
     default_status=dg.DefaultSensorStatus.STOPPED,
@@ -194,7 +316,7 @@ def dbt_cloud_state_refresh_sensor(context: dg.SensorEvaluationContext):
     )
 
     client = _get_dbt_cloud_client()
-    refreshed_workspaces: list[str] = []
+    changed_workspaces: list[dict[str, Any]] = []
 
     for ws in WORKSPACES:
         project_id_str = os.getenv(ws["project_id_env"], "")
@@ -222,55 +344,70 @@ def dbt_cloud_state_refresh_sensor(context: dg.SensorEvaluationContext):
             continue
 
         context.log.info(
-            f"New run detected in workspace '{ws['name']}': "
-            f"run_id={run_id} (previous: {ws_cursor.get('run_id')}). "
-            f"Checking manifest for structural changes..."
+            f"New run in workspace '{ws['name']}': run_id={run_id} "
+            f"(previous: {ws_cursor.get('run_id')}). Checking for structural changes..."
         )
 
-        # Fetch the manifest from this run and fingerprint it
+        # Fetch the manifest and fingerprint it
         try:
             manifest = client.get_run_manifest_json(run_id)
         except Exception as e:
-            context.log.warning(
-                f"Could not fetch manifest for run {run_id}: {e}. Skipping."
-            )
-            cursor[ws["name"]] = {"run_id": run_id, "fingerprint": ws_cursor.get("fingerprint", "")}
+            context.log.warning(f"Could not fetch manifest for run {run_id}: {e}")
+            cursor[ws["name"]] = {
+                "run_id": run_id,
+                "fingerprint": ws_cursor.get("fingerprint", ""),
+            }
             continue
 
         new_fingerprint = _compute_manifest_fingerprint(manifest)
         old_fingerprint = ws_cursor.get("fingerprint", "")
 
+        cursor[ws["name"]] = {"run_id": run_id, "fingerprint": new_fingerprint}
+
         if new_fingerprint == old_fingerprint:
             context.log.info(
                 f"Workspace '{ws['name']}' manifest unchanged "
-                f"(fingerprint: {new_fingerprint}). No refresh needed."
+                f"(fingerprint: {new_fingerprint}). Skipping."
             )
-            cursor[ws["name"]] = {"run_id": run_id, "fingerprint": new_fingerprint}
             continue
 
         context.log.info(
             f"Workspace '{ws['name']}' manifest changed: "
-            f"{old_fingerprint or '(initial)'} -> {new_fingerprint}. "
-            f"Triggering refresh."
+            f"{old_fingerprint or '(initial)'} -> {new_fingerprint}"
         )
+        changed_workspaces.append({
+            "name": ws["name"],
+            "project_id": project_id,
+            "environment_id": environment_id,
+        })
 
-        defs_state_key = _get_defs_state_key(project_id, environment_id)
-        success = _trigger_targeted_refresh(context, defs_state_key)
+    if not changed_workspaces:
+        context.update_cursor(json.dumps(cursor))
+        return dg.SkipReason("No project structure changes detected in dbt Cloud.")
 
-        cursor[ws["name"]] = {"run_id": run_id, "fingerprint": new_fingerprint}
+    # Refresh state for each changed workspace
+    any_refreshed = False
+    for ws_info in changed_workspaces:
+        defs_state_key = _get_defs_state_key(
+            ws_info["project_id"], ws_info["environment_id"]
+        )
+        if _trigger_refresh(context, defs_state_key):
+            any_refreshed = True
 
-        if success:
-            refreshed_workspaces.append(ws["name"])
+    # After refreshing state, reload the code location so it picks up new definitions
+    if any_refreshed:
+        _reload_code_location(context)
 
     context.update_cursor(json.dumps(cursor))
 
-    if refreshed_workspaces:
+    if any_refreshed:
+        names = ", ".join(w["name"] for w in changed_workspaces)
         return dg.SensorResult(
             skip_reason=None,
             cursor=json.dumps(cursor),
         )
 
-    return dg.SkipReason("No project structure changes detected in dbt Cloud.")
+    return dg.SkipReason("Refresh triggered but failed. See logs for details.")
 
 
 defs = dg.Definitions(sensors=[dbt_cloud_state_refresh_sensor])

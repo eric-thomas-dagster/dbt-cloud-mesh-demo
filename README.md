@@ -175,7 +175,7 @@ Set `refresh_if_dev: true` in the `defs_state` block of each `defs.yaml` (or rem
 Then refresh:
 
 ```bash
-uv run dg utils refresh-defs-state
+uv run dg plus deploy refresh-defs-state
 ```
 
 ### 6. Run Dagster
@@ -191,14 +191,15 @@ Open http://localhost:3000 to see the asset graph.
 When models change in dbt Cloud (new models added, schemas modified, configs updated), Dagster's cached definitions state becomes stale -- the asset graph won't reflect the changes until you either redeploy or manually run:
 
 ```bash
-dg plus deploy refresh-defs-state --deployment <name> --organization <org>
+dg plus deploy --organization <org> --deployment <deployment> refresh-defs-state
 ```
 
-This project includes a **`dbt_cloud_state_refresh_sensor`** that automates this. It polls dbt Cloud for new successful runs across all configured workspaces. When a new run is detected, it fetches the run's manifest and compares a **fingerprint** (node IDs + file checksums) against the cached fingerprint. Only when the project structure actually changed (new models, modified SQL, schema changes) does it trigger a **targeted** refresh for just the affected workspace:
-
+For local development, targeted refresh by key is available now:
 ```bash
-dg plus deploy refresh-defs-state --defs-state-key DbtCloudComponent[100002-200002]
+dg utils refresh-defs-state --defs-state-key DbtCloudComponent[100002-200002]
 ```
+
+This project includes a **`dbt_cloud_state_refresh_sensor`** that automates this. It polls dbt Cloud for new successful runs across all configured workspaces. When a new run is detected, it fetches the run's manifest and compares a **fingerprint** (node IDs + file checksums) against the cached fingerprint. Only when the project structure actually changed (new models, modified SQL, schema changes) does it trigger a refresh and reload the code location.
 
 Routine runs that don't alter the project structure are ignored -- no unnecessary refreshes.
 
@@ -227,10 +228,11 @@ Edit the `WORKSPACES` list in `defs/dbt_cloud_state_refresh_sensor.py` to match 
 2. For each workspace, fetches the latest successful run
 3. If a new run is found, fetches its manifest and computes a fingerprint (node IDs + checksums)
 4. Compares against the cached fingerprint -- if identical, no refresh needed (just a routine run)
-5. If the fingerprint changed, triggers a **targeted** `dg plus deploy refresh-defs-state --defs-state-key DbtCloudComponent[{project_id}-{environment_id}]` for only that workspace
-6. Dagster reloads definitions for the affected workspace with the updated manifest
+5. If the fingerprint changed:
+   - Triggers `dg plus deploy refresh-defs-state` to update cached state (attempts `--defs-state-key` for targeted refresh, falls back to full refresh if not yet supported)
+   - Reloads the code location via the Dagster Cloud GraphQL `reloadRepositoryLocation` mutation so the running code server picks up the new definitions
 
-The defs-state-key follows the pattern `DbtCloudComponent[{project_id}-{environment_id}]`, matching what `DbtCloudComponent.defs_state_config` generates. This avoids refreshing unrelated components.
+The defs-state-key follows the pattern `DbtCloudComponent[{project_id}-{environment_id}]`, matching what `DbtCloudComponent.defs_state_config` generates.
 
 The sensor ships with `default_status: STOPPED` -- enable it in the Dagster UI when ready.
 
@@ -271,7 +273,7 @@ When `mode: observe` is set and no sensor was created by the base component, the
 
 ### Auto-refresh sensor for dbt Cloud changes
 
-Added `dbt_cloud_state_refresh_sensor` that monitors dbt Cloud workspaces for actual project structure changes. Uses manifest fingerprinting (node IDs + file checksums) to distinguish real changes from routine runs -- only triggers a refresh when the project structure changed (new models, modified SQL, schema updates). Targets only the affected workspace via `--defs-state-key DbtCloudComponent[{project_id}-{environment_id}]` instead of refreshing all state-backed components.
+Added `dbt_cloud_state_refresh_sensor` that monitors dbt Cloud workspaces for actual project structure changes. Uses manifest fingerprinting (node IDs + file checksums) to distinguish real changes from routine runs -- only triggers a refresh when the project structure changed (new models, modified SQL, schema updates). Uses `dg plus deploy refresh-defs-state` with forward-compatible `--defs-state-key` targeting (falls back to full refresh until the flag is added to the cloud command). After refreshing state, reloads the code location via the Dagster Cloud GraphQL API so the running code server picks up the new definitions.
 
 ### Test coverage
 
