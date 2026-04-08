@@ -186,6 +186,54 @@ uv run dg dev
 
 Open http://localhost:3000 to see the asset graph.
 
+## Auto-Refreshing Definitions on dbt Cloud Changes
+
+When models change in dbt Cloud (new models added, schemas modified, configs updated), Dagster's cached definitions state becomes stale -- the asset graph won't reflect the changes until you either redeploy or manually run:
+
+```bash
+dg plus deploy refresh-defs-state --deployment <name> --organization <org>
+```
+
+This project includes a **`dbt_cloud_state_refresh_sensor`** that automates this. It polls dbt Cloud for new successful runs across all configured workspaces. When a new run is detected, it fetches the run's manifest and compares a **fingerprint** (node IDs + file checksums) against the cached fingerprint. Only when the project structure actually changed (new models, modified SQL, schema changes) does it trigger a **targeted** refresh for just the affected workspace:
+
+```bash
+dg plus deploy refresh-defs-state --defs-state-key DbtCloudComponent[100002-200002]
+```
+
+Routine runs that don't alter the project structure are ignored -- no unnecessary refreshes.
+
+### Setup
+
+Dagster Cloud automatically provides `DAGSTER_CLOUD_DEPLOYMENT_NAME` and `DAGSTER_CLOUD_ORGANIZATION` -- the `dg plus deploy refresh-defs-state` CLI reads both from the environment, so no extra configuration is needed for the refresh command.
+
+Set the dbt Cloud environment variables (shared with workspace components):
+
+```bash
+export DBT_CLOUD_ACCOUNT_ID="12345"
+export DBT_CLOUD_TOKEN="your-token"
+
+# Per-workspace project/environment IDs
+export DBT_CLOUD_SILVER_PROJECT_ID="100001"
+export DBT_CLOUD_SILVER_ENVIRONMENT_ID="200001"
+export DBT_CLOUD_GOLD_PROJECT_ID="100002"
+export DBT_CLOUD_GOLD_ENVIRONMENT_ID="200002"
+```
+
+Edit the `WORKSPACES` list in `defs/dbt_cloud_state_refresh_sensor.py` to match your workspace env var names.
+
+### How it works
+
+1. Sensor polls dbt Cloud every 5 minutes (configurable via `POLL_INTERVAL_SECONDS`)
+2. For each workspace, fetches the latest successful run
+3. If a new run is found, fetches its manifest and computes a fingerprint (node IDs + checksums)
+4. Compares against the cached fingerprint -- if identical, no refresh needed (just a routine run)
+5. If the fingerprint changed, triggers a **targeted** `dg plus deploy refresh-defs-state --defs-state-key DbtCloudComponent[{project_id}-{environment_id}]` for only that workspace
+6. Dagster reloads definitions for the affected workspace with the updated manifest
+
+The defs-state-key follows the pattern `DbtCloudComponent[{project_id}-{environment_id}]`, matching what `DbtCloudComponent.defs_state_config` generates. This avoids refreshing unrelated components.
+
+The sensor ships with `default_status: STOPPED` -- enable it in the Dagster UI when ready.
+
 ## Running with Mock State (No dbt Cloud Required)
 
 This project ships with pre-baked state files so you can explore the Dagster UI without dbt Cloud credentials:
@@ -220,6 +268,10 @@ Added `enable_dbt_selection_by_name: true` to `translation_settings` in both YAM
 When `mode: observe` is set and no sensor was created by the base component, the `DbtCloudMeshComponent` automatically creates one:
 - **With excluded packages**: Creates a mesh-aware sensor that filters out materialization events for external package models
 - **Without excluded packages**: Creates a simple observe sensor
+
+### Auto-refresh sensor for dbt Cloud changes
+
+Added `dbt_cloud_state_refresh_sensor` that monitors dbt Cloud workspaces for actual project structure changes. Uses manifest fingerprinting (node IDs + file checksums) to distinguish real changes from routine runs -- only triggers a refresh when the project structure changed (new models, modified SQL, schema updates). Targets only the affected workspace via `--defs-state-key DbtCloudComponent[{project_id}-{environment_id}]` instead of refreshing all state-backed components.
 
 ### Test coverage
 
