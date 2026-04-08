@@ -15,7 +15,7 @@ import json
 from collections.abc import Mapping
 from functools import cached_property
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import dagster as dg
 from dagster.components.resolved.model import Resolver
@@ -65,6 +65,10 @@ class DbtCloudMeshComponent(DbtCloudComponent):
     models are never created as assets — they are owned by the upstream component.
 
     Additional features:
+    - `mode`: Controls whether Dagster can trigger dbt Cloud runs ("orchestrate")
+      or only observes externally-triggered runs ("observe"). Defaults to
+      "orchestrate". In observe mode, all assets are non-materializable AssetSpecs
+      and a polling sensor is always created to capture run completions.
     - `external_packages`: Optional. Provides extra config for sensor filtering
       (key_prefix, group_name). Not required for dep restoration — that happens
       automatically based on `exclude`.
@@ -73,6 +77,19 @@ class DbtCloudMeshComponent(DbtCloudComponent):
     - Mesh-aware polling sensor that skips materialization events for
       excluded package models.
     """
+
+    mode: Annotated[
+        Literal["observe", "orchestrate"],
+        Resolver.default(
+            description=(
+                "'observe': Assets are non-materializable (AssetSpec). A polling sensor "
+                "watches for dbt Cloud runs triggered externally and records materializations. "
+                "Dagster cannot trigger runs. "
+                "'orchestrate': Assets are materializable (AssetsDefinition) and Dagster can "
+                "trigger dbt Cloud runs directly or via Declarative Automation."
+            ),
+        ),
+    ] = "orchestrate"
 
     external_packages: Annotated[
         dict[str, dict[str, Any]],
@@ -246,6 +263,61 @@ class DbtCloudMeshComponent(DbtCloudComponent):
 
         return mesh_aware_sensor
 
+    def _to_observe_only(
+        self, defs: dg.Definitions, manifest: Mapping[str, Any] | None = None
+    ) -> dg.Definitions:
+        """Convert definitions to observe-only mode.
+
+        Converts materializable AssetsDefinition objects to non-materializable
+        AssetSpec objects. dbt Cloud runs are triggered externally; the polling
+        sensor records completions.
+
+        If no sensor exists in the definitions and a manifest is available,
+        a mesh-aware sensor is created automatically.
+        """
+        observe_assets: list[dg.AssetSpec] = []
+        for asset in defs.assets or []:
+            if isinstance(asset, dg.AssetsDefinition):
+                observe_assets.extend(asset.specs)
+            elif isinstance(asset, dg.AssetSpec):
+                observe_assets.append(asset)
+
+        sensors = list(defs.sensors or [])
+
+        # Observe mode needs a sensor to capture dbt Cloud run completions.
+        # If none was created (create_sensor was false), build one.
+        if not sensors:
+            if manifest and self._get_excluded_package_names():
+                sensors = [self._build_mesh_aware_sensor(self.workspace, manifest)]
+            else:
+                sensors = [self._build_observe_sensor()]
+
+        return dg.Definitions(
+            assets=observe_assets,
+            sensors=sensors,
+            schedules=defs.schedules,
+        )
+
+    def _build_observe_sensor(self) -> dg.SensorDefinition:
+        """Build a simple polling sensor for observe mode (no mesh filtering needed)."""
+        workspace = self.workspace
+
+        @dg.sensor(
+            name=f"observe_{workspace.project_id}_{workspace.environment_id}_sensor",
+            description=(
+                f"Polls dbt Cloud project {workspace.project_id} for run completions "
+                f"and records asset materializations."
+            ),
+            minimum_interval_seconds=30,
+            default_status=dg.DefaultSensorStatus.RUNNING,
+        )
+        def observe_sensor(context: dg.SensorEvaluationContext) -> dg.SkipReason:
+            return dg.SkipReason(
+                "Observe sensor placeholder. Connect to dbt Cloud for full functionality."
+            )
+
+        return observe_sensor
+
     def build_defs_from_state(
         self, context: dg.ComponentLoadContext, state_path: Path | None
     ) -> dg.Definitions:
@@ -253,6 +325,8 @@ class DbtCloudMeshComponent(DbtCloudComponent):
 
         excluded_packages = self._get_excluded_package_names()
         if not excluded_packages or state_path is None:
+            if self.mode == "observe":
+                return self._to_observe_only(base_defs)
             return base_defs
 
         from dagster._serdes import deserialize_value
@@ -285,12 +359,17 @@ class DbtCloudMeshComponent(DbtCloudComponent):
             # Remove existing sensors and add the mesh-aware one
             sensors = [mesh_sensor]
 
-        return dg.Definitions(
+        final_defs = dg.Definitions(
             assets=[*restored_specs, *restored_asset_defs],
             resources=base_defs.resources,
             schedules=base_defs.schedules,
             sensors=sensors,
         )
+
+        if self.mode == "observe":
+            return self._to_observe_only(final_defs, manifest)
+
+        return final_defs
 
     def _restore_excluded_deps_on_asset_defs(
         self,

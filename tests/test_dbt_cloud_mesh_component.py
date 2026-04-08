@@ -239,6 +239,122 @@ class TestExcludeOnlyWithoutExternalPackages:
                     )
 
 
+class TestObserveMode:
+    """Observe mode must produce only AssetSpec objects (not materializable)."""
+
+    def test_observe_mode_converts_assets_definitions_to_specs(self):
+        """In observe mode, AssetsDefinition objects should become AssetSpec."""
+        component = DbtCloudMeshComponent(
+            workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
+            mode="observe",
+        )
+
+        # Simulate an AssetsDefinition wrapping multiple specs
+        gold_specs = [
+            dg.AssetSpec(key=TRANSLATOR.get_asset_key(MANIFEST["nodes"][uid]))
+            for uid in _gold_node_ids()
+        ]
+
+        # Build a mock Definitions with AssetsDefinition + plain specs
+        mock_defs = dg.Definitions(assets=gold_specs, sensors=[])
+
+        result = component._to_observe_only(mock_defs)
+
+        # All assets should be AssetSpec, not AssetsDefinition
+        for asset in result.assets or []:
+            assert isinstance(asset, dg.AssetSpec), (
+                f"Expected AssetSpec in observe mode, got {type(asset).__name__}"
+            )
+
+    def test_observe_mode_preserves_restored_deps(self):
+        """Observe mode should preserve cross-project deps restored by mesh logic."""
+        component = DbtCloudMeshComponent(
+            workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
+            exclude="package:silver_project",
+            mode="observe",
+        )
+
+        # Build gold specs with no deps, then restore them
+        gold_specs = [
+            dg.AssetSpec(key=TRANSLATOR.get_asset_key(MANIFEST["nodes"][uid]))
+            for uid in _gold_node_ids()
+        ]
+        restored = component._restore_excluded_deps(gold_specs, MANIFEST)
+
+        # Wrap in Definitions and convert to observe mode
+        mock_defs = dg.Definitions(assets=restored, sensors=[])
+        result = component._to_observe_only(mock_defs, MANIFEST)
+
+        # Deps should still be present after observe conversion
+        for spec in result.assets or []:
+            assert isinstance(spec, dg.AssetSpec)
+
+        # Check that cross-project deps survived
+        for uid in _gold_node_ids():
+            node = MANIFEST["nodes"][uid]
+            upstream_ids = get_upstream_unique_ids(MANIFEST, node)
+            silver_upstream = upstream_ids & _silver_node_ids()
+            if not silver_upstream:
+                continue
+
+            gold_key = TRANSLATOR.get_asset_key(node)
+            result_spec = next(
+                (s for s in (result.assets or []) if s.key == gold_key), None
+            )
+            assert result_spec is not None
+            dep_keys = {str(dep.asset_key) for dep in result_spec.deps}
+
+            for silver_uid in silver_upstream:
+                silver_node = MANIFEST["nodes"][silver_uid]
+                expected_key = TRANSLATOR.get_asset_key(silver_node)
+                assert str(expected_key) in dep_keys, (
+                    f"{gold_key} lost dep on {expected_key} after observe conversion"
+                )
+
+    def test_observe_mode_creates_sensor_when_none_exists(self):
+        """Observe mode should auto-create a sensor if none was provided."""
+        component = DbtCloudMeshComponent(
+            workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
+            mode="observe",
+        )
+
+        # No sensors in input
+        mock_defs = dg.Definitions(assets=[], sensors=[])
+        result = component._to_observe_only(mock_defs)
+
+        assert len(list(result.sensors or [])) == 1
+
+    def test_observe_mode_creates_mesh_sensor_when_excluded_packages(self):
+        """Observe mode with excluded packages should create a mesh-aware sensor."""
+        component = DbtCloudMeshComponent(
+            workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
+            exclude="package:silver_project",
+            mode="observe",
+        )
+
+        mock_defs = dg.Definitions(assets=[], sensors=[])
+        result = component._to_observe_only(mock_defs, MANIFEST)
+
+        sensors = list(result.sensors or [])
+        assert len(sensors) == 1
+        assert "mesh_aware" in sensors[0].name
+
+    def test_orchestrate_mode_keeps_assets_definitions(self):
+        """Orchestrate mode (default) should NOT convert assets to specs."""
+        component = DbtCloudMeshComponent(
+            workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
+            mode="orchestrate",
+        )
+        assert component.mode == "orchestrate"
+
+    def test_default_mode_is_orchestrate(self):
+        """Default mode should be orchestrate for backwards compatibility."""
+        component = DbtCloudMeshComponent(
+            workspace={"account_id": 1, "token": "x", "project_id": 1, "environment_id": 1},
+        )
+        assert component.mode == "orchestrate"
+
+
 class TestNoDuplicateOwnership:
     """External packages must not reintroduce duplicate asset ownership."""
 

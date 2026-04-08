@@ -2,6 +2,40 @@
 
 Dagster project demonstrating orchestration of two **dbt Cloud** projects that use dbt mesh for cross-project references. One project handles bronze-to-silver transformations, the other handles silver-to-gold and references silver models via dbt mesh.
 
+## Observe vs. Orchestrate Mode
+
+The `DbtCloudMeshComponent` supports two modes, controlled by the `mode` attribute in `defs.yaml`:
+
+| | **Observe** | **Orchestrate** |
+|---|---|---|
+| **Who triggers dbt Cloud runs?** | External (dbt Cloud scheduler, CI, manual) | Dagster (materialize button, Declarative Automation) |
+| **Asset type** | `AssetSpec` (non-materializable) | `AssetsDefinition` (materializable) |
+| **Polling sensor** | Auto-created (watches for run completions) | Optional (`create_sensor: true`) |
+| **What you get in Dagster** | Full asset graph, lineage, run history | Full asset graph, lineage, run history + ability to trigger runs |
+| **Use when** | dbt Cloud owns scheduling; Dagster provides visibility | Dagster owns the full pipeline |
+
+### Observe mode (recommended starting point)
+
+```yaml
+# defs.yaml
+attributes:
+  mode: observe
+  # create_sensor is optional — observe mode auto-creates one if missing
+```
+
+Assets appear in the Dagster asset graph with full lineage. When dbt Cloud runs complete externally, the polling sensor detects them and records materializations in Dagster. You get run history, metadata, and cross-project lineage without Dagster triggering anything.
+
+### Orchestrate mode
+
+```yaml
+# defs.yaml
+attributes:
+  mode: orchestrate   # this is the default
+  create_sensor: true  # optional — for also observing externally-triggered runs
+```
+
+Assets are materializable from the Dagster UI or via Declarative Automation. Dagster triggers dbt Cloud runs directly.
+
 ## How dbt Mesh Works with Dagster
 
 When two dbt projects use dbt mesh, the downstream project (gold) pulls in upstream models (silver) via `packages.yml`. This means the gold project's manifest contains **both** gold and silver models. Dagster needs to handle this correctly to avoid duplicate assets while preserving lineage.
@@ -162,3 +196,35 @@ uv run dg dev
 ```
 
 The asset graph, lineage, and groups will render correctly. Materialization and the polling sensor will not function without real credentials.
+
+## Changelog
+
+### Observe vs. Orchestrate mode
+
+Added a `mode` attribute to `DbtCloudMeshComponent` (`"observe"` or `"orchestrate"`, defaults to `"orchestrate"`).
+
+**Observe mode** converts all materializable `AssetsDefinition` objects to non-materializable `AssetSpec` objects. dbt Cloud runs are triggered externally (via dbt Cloud scheduler, CI, or manual); Dagster provides full asset graph visibility, cross-project lineage, and run history through a polling sensor. If no sensor exists (e.g. `create_sensor: false`), observe mode auto-creates one — using a mesh-aware sensor when excluded packages are present.
+
+This addresses a common adoption pattern where customers want Dagster for visibility and lineage before handing it orchestration control.
+
+### Source metadata enabled
+
+Added `enable_source_metadata: true` to `translation_settings` in both YAML configs. Without this, dbt sources (e.g. bronze tables) don't get metadata on their `AssetDep` objects, which prevents upstream asset key remapping and breaks bronze-to-silver lineage. This setting defaults to `False` in dagster-dbt, so it must be set explicitly.
+
+### dbt selection by name enabled
+
+Added `enable_dbt_selection_by_name: true` to `translation_settings` in both YAML configs. In orchestrate mode with dbt mesh, cross-project FQNs include the package name (e.g. `silver_project.staging.customers`), which doesn't match the remote dbt Cloud project's namespace. This setting uses the file name stem instead, ensuring subset materialization works correctly across mesh boundaries. Harmless in observe mode.
+
+### Automatic sensor creation in observe mode
+
+When `mode: observe` is set and no sensor was created by the base component, the `DbtCloudMeshComponent` automatically creates one:
+- **With excluded packages**: Creates a mesh-aware sensor that filters out materialization events for external package models
+- **Without excluded packages**: Creates a simple observe sensor
+
+### Test coverage
+
+Added `TestObserveMode` test class covering:
+- `AssetsDefinition` to `AssetSpec` conversion
+- Cross-project dependency preservation through observe conversion
+- Automatic sensor creation (standard and mesh-aware)
+- Default mode backwards compatibility

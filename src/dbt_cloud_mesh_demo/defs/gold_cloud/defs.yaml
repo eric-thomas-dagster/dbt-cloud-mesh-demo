@@ -11,6 +11,12 @@ attributes:
   op:
     name: gold_dbt_cloud_assets
 
+  # "observe" = Dagster watches dbt Cloud runs but does not trigger them.
+  #   Assets are non-materializable; a polling sensor captures run completions.
+  # "orchestrate" = Dagster can trigger dbt Cloud runs directly.
+  #   Assets are materializable; supports Declarative Automation.
+  mode: observe
+
   # Don't refresh state from dbt Cloud on dev load (using pre-baked state)
   defs_state:
     management_type: LOCAL_FILESYSTEM
@@ -20,6 +26,7 @@ attributes:
   exclude: "package:silver_project"
 
   # Polling sensor observes dbt Cloud runs triggered outside Dagster.
+  # In observe mode, a sensor is created automatically even if this is false.
   # Set to true when using real dbt Cloud credentials.
   create_sensor: false
 
@@ -28,6 +35,15 @@ attributes:
     silver_project:
       key_prefix: ["silver_project"]
       group_name: "silver"
+
+  # Enable source metadata so dbt sources appear as upstream assets with
+  # proper lineage and key remapping.
+  translation_settings:
+    enable_source_metadata: true
+    # Use dbt file name (not FQN) when selecting models for execution.
+    # Needed for orchestrate mode with dbt mesh — cross-project FQNs include
+    # the package name, which doesn't match the remote project's namespace.
+    enable_dbt_selection_by_name: true
 
   # Group overrides for gold project models
   group_overrides:
