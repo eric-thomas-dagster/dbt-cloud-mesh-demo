@@ -304,11 +304,11 @@ def _reload_code_location(context: dg.SensorEvaluationContext) -> bool:
 @dg.sensor(
     name="dbt_cloud_state_refresh_sensor",
     description=(
-        "Monitors dbt Cloud workspaces for project structure changes (new models, "
-        "modified SQL, schema updates). Compares manifest fingerprints to detect "
-        "real changes — routine runs that don't alter the project are ignored. "
-        "When a change is detected, refreshes the definitions state and reloads "
-        "the code location."
+        "[Experimental] Monitors dbt Cloud workspaces for project structure changes "
+        "(new models, modified SQL, schema updates). Compares manifest fingerprints "
+        "to detect real changes — routine runs that don't alter the project are "
+        "ignored. When a change is detected, refreshes the definitions state and "
+        "reloads the code location."
     ),
     minimum_interval_seconds=POLL_INTERVAL_SECONDS,
     default_status=dg.DefaultSensorStatus.STOPPED,

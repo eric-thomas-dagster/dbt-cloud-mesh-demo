@@ -186,7 +186,7 @@ uv run dg dev
 
 Open http://localhost:3000 to see the asset graph.
 
-## Auto-Refreshing Definitions on dbt Cloud Changes
+## Auto-Refreshing Definitions on dbt Cloud Changes (Experimental)
 
 When models change in dbt Cloud (new models added, schemas modified, configs updated), Dagster's cached definitions state becomes stale -- the asset graph won't reflect the changes until you either redeploy or manually run:
 
@@ -276,7 +276,7 @@ When `mode: observe` is set and no sensor was created by the base component, the
 - **With excluded packages**: Creates a mesh-aware sensor that filters out materialization events for external package models
 - **Without excluded packages**: Creates a simple observe sensor
 
-### Auto-refresh sensor for dbt Cloud changes
+### Auto-refresh sensor for dbt Cloud changes (Experimental)
 
 Added `dbt_cloud_state_refresh_sensor` that monitors dbt Cloud workspaces for actual project structure changes. Uses manifest fingerprinting (node IDs + file checksums) to distinguish real changes from routine runs -- only triggers a refresh when the project structure changed (new models, modified SQL, schema updates). Uses `dg plus deploy refresh-defs-state` with forward-compatible `--defs-state-key` targeting (falls back to full refresh until the flag is added to the cloud command). After refreshing state, reloads the code location via the Dagster Cloud GraphQL API so the running code server picks up the new definitions.
 
