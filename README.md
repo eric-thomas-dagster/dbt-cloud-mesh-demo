@@ -254,6 +254,22 @@ The asset graph, lineage, and groups will render correctly. Materialization and 
 
 ## Changelog
 
+### Mid-run per-model failure monitoring (DbtCloudRunMonitor)
+
+Added `run_monitor.py` with a `DbtCloudRunMonitor` class that replaces the standard wait-for-completion pattern with active mid-run monitoring. Parses dbt Cloud debug logs every N seconds (default 5s) to detect individual model OK/ERROR results during execution — without waiting for the entire job to finish.
+
+- **Per-model granularity**: Detects model failures as dbt logs them, not after the run/step completes
+- **Fail-fast cancellation**: `fail_fast=True` cancels the dbt Cloud run on the first model failure and fails the Dagster run immediately
+- **Configurable poll interval**: Runs inside asset execution (not a sensor), so no minimum interval restriction — can poll as aggressively as needed
+- **Two detection layers**: Debug log parsing (real-time, per-model) + `run_results.json` artifact checking (per-step)
+- **Self-diagnosing**: First poll logs whether debug logs are available in the API response, so you immediately know if log parsing is working
+
+Use case: Engineers no longer need to manually monitor multi-hour dbt Cloud jobs. Dagster detects failures in seconds, cancels the run, and alerts via Dagster+ notifications (Slack/PagerDuty/email).
+
+See `defs/dbt_cloud_triggered_assets_example.py` for usage with `@dbt_cloud_assets`.
+
+Known limitation: Debug log parsing relies on dbt's console output format (consistent but not a structured API). dbt Cloud's Discovery API and `run_results.json` only update after run/step completion. For true real-time per-model streaming, use dbt Core via `DbtCliResource`.
+
 ### Observe vs. Orchestrate mode
 
 Added a `mode` attribute to `DbtCloudMeshComponent` (`"observe"` or `"orchestrate"`, defaults to `"orchestrate"`).
