@@ -223,10 +223,12 @@ class DbtCloudRunMonitor:
                     f"Failed: {failed_models}"
                 )
                 self.cancel_run(context)
-                raise Exception(
-                    f"dbt Cloud run {self.run_id} cancelled — "
-                    f"model failures detected: {failed_models}"
-                )
+                # Return normally — let get_asset_events() try to yield
+                # partial results for models that completed before cancellation.
+                # If run_results.json isn't available (too early), no events
+                # are yielded and all assets fail, which is acceptable for
+                # fail_fast — you stopped early on purpose.
+                return
 
             # 5. Terminal state?
             if run.status in TERMINAL_STATUSES:
@@ -249,11 +251,14 @@ class DbtCloudRunMonitor:
                     return
 
                 if run.status == DbtCloudJobRunStatusType.CANCELLED:
-                    # Cancellation means no results — raise so the whole
-                    # step fails (nothing to yield).
-                    raise Exception(
-                        f"dbt Cloud run {self.run_id} was CANCELLED"
+                    context.log.warning(
+                        f"Run {self.run_id} was CANCELLED. "
+                        f"Attempting to yield partial results if available."
                     )
+                    # Return normally — get_asset_events() will try to fetch
+                    # run_results.json. If available, partial results are yielded.
+                    # If not, no events → all assets show as failed.
+                    return
 
                 context.log.info(
                     f"Run {self.run_id} completed successfully. "
