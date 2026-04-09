@@ -6,6 +6,7 @@ this component ensures that:
 1. Excluded package models are NOT created as Dagster assets (no duplication)
 2. Downstream assets RETAIN dependency edges to upstream excluded models
 3. The polling sensor skips materialization events for excluded package models
+4. (Optional) Mid-run monitoring detects per-model failures during execution
 
 This is necessary because the standard DbtCloudComponent's `exclude` filter
 may drop both the asset AND the dependency edges, breaking cross-project lineage.
@@ -23,6 +24,8 @@ from dagster_dbt import DagsterDbtTranslator, DbtCloudComponent
 from dagster_dbt.asset_utils import get_node, get_upstream_unique_ids
 from dagster_dbt.cloud_v2.resources import DbtCloudWorkspace
 from pydantic import Field
+
+from dbt_cloud_mesh_demo.defs.run_monitor import DbtCloudRunMonitor
 
 
 class _MeshAwareTranslator(DagsterDbtTranslator):
@@ -114,6 +117,32 @@ class DbtCloudMeshComponent(DbtCloudComponent):
             ),
         ),
     ] = Field(default_factory=dict)
+
+    fail_fast: Annotated[
+        bool,
+        Resolver.default(
+            description=(
+                "Enable mid-run per-model failure monitoring in orchestrate mode. "
+                "When true, Dagster parses dbt Cloud debug logs during execution to "
+                "detect individual model failures as they happen. On first failure, "
+                "the dbt Cloud run is cancelled and the Dagster run fails immediately. "
+                "Eliminates the need for engineers to manually monitor long-running jobs. "
+                "No effect in observe mode."
+            ),
+        ),
+    ] = False
+
+    poll_interval: Annotated[
+        float,
+        Resolver.default(
+            description=(
+                "Seconds between debug log polls when fail_fast is enabled. "
+                "Runs inside asset execution (not a sensor), so there is no minimum "
+                "interval. Lower values (e.g. 5) catch failures faster but make more "
+                "API calls. Default 5 seconds."
+            ),
+        ),
+    ] = 5.0
 
     @cached_property
     def translator(self) -> DagsterDbtTranslator:
@@ -327,6 +356,8 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         if not excluded_packages or state_path is None:
             if self.mode == "observe":
                 return self._to_observe_only(base_defs)
+            if self.fail_fast:
+                return self._apply_run_monitoring(base_defs)
             return base_defs
 
         from dagster._serdes import deserialize_value
@@ -369,7 +400,83 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         if self.mode == "observe":
             return self._to_observe_only(final_defs, manifest)
 
+        if self.fail_fast:
+            return self._apply_run_monitoring(final_defs)
+
         return final_defs
+
+    def _apply_run_monitoring(
+        self, defs: dg.Definitions
+    ) -> dg.Definitions:
+        """Replace standard orchestrate assets with monitored versions.
+
+        Swaps each AssetsDefinition to use DbtCloudRunMonitor instead of the
+        standard wait-for-completion pattern. The monitor parses debug logs
+        mid-run for per-model failure detection.
+        """
+        monitored_assets: list[Any] = []
+        for asset in defs.assets or []:
+            if isinstance(asset, dg.AssetsDefinition):
+                monitored_assets.append(self._build_monitored_asset(asset))
+            else:
+                monitored_assets.append(asset)
+
+        return dg.Definitions(
+            assets=monitored_assets,
+            resources=defs.resources,
+            schedules=defs.schedules,
+            sensors=defs.sensors,
+        )
+
+    def _build_monitored_asset(
+        self, original: dg.AssetsDefinition
+    ) -> dg.AssetsDefinition:
+        """Create a monitored version of an AssetsDefinition.
+
+        Uses workspace.cli() to trigger the run (which handles subset
+        selection automatically), then replaces .wait() with the
+        DbtCloudRunMonitor for per-model failure detection.
+        """
+        workspace = self.workspace
+        translator = self.translator
+        poll_interval = self.poll_interval
+
+        @dg.multi_asset(
+            specs=list(original.specs),
+            check_specs=list(original.check_specs),
+            can_subset=True,
+            name=original.op.name,
+        )
+        def _monitored_dbt_cloud_assets(
+            context: dg.AssetExecutionContext,
+        ):
+            # workspace.cli() handles subset selection and triggers the run
+            invocation = workspace.cli(
+                ["build"],
+                dagster_dbt_translator=translator,
+                context=context,
+            )
+
+            run_id = invocation.run_handler.run_id
+            context.log.info(f"Triggered dbt Cloud run {run_id}")
+
+            # Monitor with per-model failure detection instead of .wait()
+            monitor = DbtCloudRunMonitor(
+                client=invocation.client,
+                run_id=run_id,
+                poll_interval=poll_interval,
+                fail_fast=True,
+            )
+            monitor.poll(context)
+
+            # Yield standard Dagster events from final run_results.json
+            yield from monitor.get_asset_events(
+                manifest=invocation.manifest,
+                dagster_dbt_translator=invocation.dagster_dbt_translator,
+                context=context,
+            )
+
+        return _monitored_dbt_cloud_assets
 
     def _restore_excluded_deps_on_asset_defs(
         self,

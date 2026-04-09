@@ -36,6 +36,18 @@ attributes:
 
 Assets are materializable from the Dagster UI or via Declarative Automation. Dagster triggers dbt Cloud runs directly.
 
+### Orchestrate mode with fail-fast monitoring
+
+```yaml
+# defs.yaml
+attributes:
+  mode: orchestrate
+  fail_fast: true       # detect per-model failures mid-run
+  poll_interval: 5      # check debug logs every 5 seconds
+```
+
+When `fail_fast: true`, Dagster parses dbt Cloud's debug logs every `poll_interval` seconds during execution. Individual model failures are detected as dbt logs them — not after the entire run finishes. On first failure, the dbt Cloud run is cancelled and the Dagster run fails immediately with the error details. Pair with Dagster+ alerting (Slack/PagerDuty/email) to eliminate manual monitoring of long-running jobs.
+
 ## How dbt Mesh Works with Dagster
 
 When two dbt projects use dbt mesh, the downstream project (gold) pulls in upstream models (silver) via `packages.yml`. This means the gold project's manifest contains **both** gold and silver models. Dagster needs to handle this correctly to avoid duplicate assets while preserving lineage.
@@ -254,19 +266,29 @@ The asset graph, lineage, and groups will render correctly. Materialization and 
 
 ## Changelog
 
-### Mid-run per-model failure monitoring (DbtCloudRunMonitor)
+### Mid-run per-model failure monitoring (fail_fast)
 
-Added `run_monitor.py` with a `DbtCloudRunMonitor` class that replaces the standard wait-for-completion pattern with active mid-run monitoring. Parses dbt Cloud debug logs every N seconds (default 5s) to detect individual model OK/ERROR results during execution — without waiting for the entire job to finish.
+Added `fail_fast` and `poll_interval` attributes to `DbtCloudMeshComponent`. In orchestrate mode with `fail_fast: true`, the component automatically replaces the standard wait-for-completion execution with active mid-run monitoring — no custom Python code needed.
+
+```yaml
+# Just add these two lines to defs.yaml
+attributes:
+  fail_fast: true
+  poll_interval: 5
+```
+
+Under the hood, `DbtCloudRunMonitor` (`defs/run_monitor.py`) parses dbt Cloud debug logs every `poll_interval` seconds to detect individual model OK/ERROR results during execution.
 
 - **Per-model granularity**: Detects model failures as dbt logs them, not after the run/step completes
-- **Fail-fast cancellation**: `fail_fast=True` cancels the dbt Cloud run on the first model failure and fails the Dagster run immediately
-- **Configurable poll interval**: Runs inside asset execution (not a sensor), so no minimum interval restriction — can poll as aggressively as needed
+- **Fail-fast cancellation**: Cancels the dbt Cloud run on the first model failure and fails the Dagster run immediately
+- **Integrated into the component**: No separate Python asset code required — just YAML config
+- **Configurable poll interval**: Runs inside asset execution (not a sensor), so no minimum interval restriction
 - **Two detection layers**: Debug log parsing (real-time, per-model) + `run_results.json` artifact checking (per-step)
-- **Self-diagnosing**: First poll logs whether debug logs are available in the API response, so you immediately know if log parsing is working
+- **Self-diagnosing**: First poll logs whether debug logs are available in the API response
 
 Use case: Engineers no longer need to manually monitor multi-hour dbt Cloud jobs. Dagster detects failures in seconds, cancels the run, and alerts via Dagster+ notifications (Slack/PagerDuty/email).
 
-See `defs/dbt_cloud_triggered_assets_example.py` for usage with `@dbt_cloud_assets`.
+Also available as a standalone utility — see `defs/dbt_cloud_triggered_assets_example.py` for usage with `@dbt_cloud_assets` outside the component pattern.
 
 Known limitation: Debug log parsing relies on dbt's console output format (consistent but not a structured API). dbt Cloud's Discovery API and `run_results.json` only update after run/step completion. For true real-time per-model streaming, use dbt Core via `DbtCliResource`.
 
