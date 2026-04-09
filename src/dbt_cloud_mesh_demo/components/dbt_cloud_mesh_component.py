@@ -501,36 +501,21 @@ class DbtCloudMeshComponent(DbtCloudComponent):
             run_id = invocation.run_handler.run_id
             context.log.info(f"Triggered dbt Cloud run {run_id}")
 
-            # Monitor with per-model logging instead of .wait()
-            # fail_fast=True: cancel on first failure
-            # fail_fast=False: log failures but let the run continue
+            # Stream events mid-run — like dbt Core's .stream() but for dbt Cloud.
+            # Yields Output events as models complete (from debug logs),
+            # then remaining events from run_results.json on completion.
+            # Raises Failure if any models errored.
             monitor = DbtCloudRunMonitor(
                 client=invocation.client,
                 run_id=run_id,
                 poll_interval=poll_interval,
                 fail_fast=fail_fast,
             )
-            monitor.poll(context)
-
-            # Yield standard Dagster events from final run_results.json
-            yield from monitor.get_asset_events(
+            yield from monitor.stream(
+                context=context,
                 manifest=invocation.manifest,
                 dagster_dbt_translator=invocation.dagster_dbt_translator,
-                context=context,
             )
-
-            # After yielding partial results, raise Failure if there were
-            # errors — matching OOTB behavior where the step fails but
-            # successful model materializations are still recorded.
-            failures = [r for r in monitor._all_results if r.status in ("error", "fail")]
-            if failures:
-                failed_names = ", ".join(f.unique_id for f in failures)
-                from dagster import Failure, MetadataValue
-
-                raise Failure(
-                    f"dbt Cloud run '{run_id}' had {len(failures)} failure(s): {failed_names}",
-                    metadata={"run_id": MetadataValue.int(run_id)},
-                )
 
         return _monitored_dbt_cloud_assets
 
