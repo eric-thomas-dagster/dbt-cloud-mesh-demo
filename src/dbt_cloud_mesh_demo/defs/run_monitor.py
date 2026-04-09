@@ -268,12 +268,15 @@ class DbtCloudRunMonitor:
                         f"{len(failures)} model failure(s) detected across "
                         f"{total} total results."
                     )
-                    raise Exception(
-                        f"dbt Cloud run {self.run_id} finished with ERROR. "
-                        f"Failed models: "
-                        f"{', '.join(f.unique_id for f in failures) or 'see dbt Cloud logs'}"
-                    )
+                    # Don't raise here — return and let get_asset_events()
+                    # yield Output events for the models that succeeded.
+                    # Models that failed won't get an Output, so Dagster
+                    # will mark only those assets as failed.
+                    return
+
                 if run.status == DbtCloudJobRunStatusType.CANCELLED:
+                    # Cancellation means no results — raise so the whole
+                    # step fails (nothing to yield).
                     raise Exception(
                         f"dbt Cloud run {self.run_id} was CANCELLED"
                     )
