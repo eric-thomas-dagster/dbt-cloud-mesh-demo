@@ -277,7 +277,7 @@ attributes:
   poll_interval: 5
 ```
 
-Under the hood, `DbtCloudRunMonitor` (`defs/run_monitor.py`) parses dbt Cloud debug logs every `poll_interval` seconds to detect individual model OK/ERROR results during execution.
+Under the hood, the component parses dbt Cloud debug logs every `poll_interval` seconds to detect individual model OK/ERROR results during execution.
 
 - **Per-model granularity**: Detects model failures as dbt logs them, not after the run/step completes
 - **Fail-fast cancellation**: Cancels the dbt Cloud run on the first model failure and fails the Dagster run immediately
@@ -287,8 +287,6 @@ Under the hood, `DbtCloudRunMonitor` (`defs/run_monitor.py`) parses dbt Cloud de
 - **Self-diagnosing**: First poll logs whether debug logs are available in the API response
 
 Use case: Engineers no longer need to manually monitor multi-hour dbt Cloud jobs. Dagster detects failures in seconds, cancels the run, and alerts via Dagster+ notifications (Slack/PagerDuty/email).
-
-Also available as a standalone utility — see `defs/dbt_cloud_triggered_assets_example.py` for usage with `@dbt_cloud_assets` outside the component pattern.
 
 Known limitation: Debug log parsing relies on dbt's console output format (consistent but not a structured API). dbt Cloud's Discovery API and `run_results.json` only update after run/step completion. For true real-time per-model streaming, use dbt Core via `DbtCliResource`.
 
