@@ -285,7 +285,7 @@ class DbtCloudRunMonitor:
                 method="get",
                 endpoint=f"runs/{self.run_id}",
                 base_url=self.client.api_v2_url,
-                params={"include_related": '["debug_logs"]'},
+                params={"include_related": '["run_steps","debug_logs"]'},
             )
             return response["data"]
         except Exception:
