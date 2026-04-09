@@ -118,16 +118,28 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         ),
     ] = Field(default_factory=dict)
 
+    monitor_runs: Annotated[
+        bool,
+        Resolver.default(
+            description=(
+                "Enable mid-run per-model monitoring in orchestrate mode. "
+                "When true, Dagster parses dbt Cloud debug logs during execution "
+                "to detect and log individual model successes and failures as they "
+                "happen — instead of waiting for the entire job to finish. "
+                "No effect in observe mode."
+            ),
+        ),
+    ] = False
+
     fail_fast: Annotated[
         bool,
         Resolver.default(
             description=(
-                "Enable mid-run per-model failure monitoring in orchestrate mode. "
-                "When true, Dagster parses dbt Cloud debug logs during execution to "
-                "detect individual model failures as they happen. On first failure, "
-                "the dbt Cloud run is cancelled and the Dagster run fails immediately. "
-                "Eliminates the need for engineers to manually monitor long-running jobs. "
-                "No effect in observe mode."
+                "Only applies when monitor_runs is true. "
+                "When true, the dbt Cloud run is cancelled on the first model "
+                "failure and the Dagster run fails immediately. "
+                "When false, failures are logged in real time but the run "
+                "continues so all failures are captured in a single run."
             ),
         ),
     ] = False
@@ -136,7 +148,7 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         float,
         Resolver.default(
             description=(
-                "Seconds between debug log polls when fail_fast is enabled. "
+                "Seconds between debug log polls when monitor_runs is enabled. "
                 "Runs inside asset execution (not a sensor), so there is no minimum "
                 "interval. Lower values (e.g. 5) catch failures faster but make more "
                 "API calls. Default 5 seconds."
@@ -356,7 +368,7 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         if not excluded_packages or state_path is None:
             if self.mode == "observe":
                 return self._to_observe_only(base_defs)
-            if self.fail_fast:
+            if self.monitor_runs:
                 return self._apply_run_monitoring(base_defs)
             return base_defs
 
@@ -400,7 +412,7 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         if self.mode == "observe":
             return self._to_observe_only(final_defs, manifest)
 
-        if self.fail_fast:
+        if self.monitor_runs:
             return self._apply_run_monitoring(final_defs)
 
         return final_defs
@@ -440,6 +452,7 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         workspace = self.workspace
         translator = self.translator
         poll_interval = self.poll_interval
+        fail_fast = self.fail_fast
 
         @dg.multi_asset(
             specs=list(original.specs),
@@ -460,12 +473,14 @@ class DbtCloudMeshComponent(DbtCloudComponent):
             run_id = invocation.run_handler.run_id
             context.log.info(f"Triggered dbt Cloud run {run_id}")
 
-            # Monitor with per-model failure detection instead of .wait()
+            # Monitor with per-model logging instead of .wait()
+            # fail_fast=True: cancel on first failure
+            # fail_fast=False: log failures but let the run continue
             monitor = DbtCloudRunMonitor(
                 client=invocation.client,
                 run_id=run_id,
                 poll_interval=poll_interval,
-                fail_fast=True,
+                fail_fast=fail_fast,
             )
             monitor.poll(context)
 
