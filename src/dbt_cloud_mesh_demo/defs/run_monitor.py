@@ -190,10 +190,12 @@ class DbtCloudRunMonitor:
             if poll_count == 1:
                 run_steps = run_details.get("run_steps", [])
                 step_ids = [s.get("id") for s in run_steps]
+                run_url = run.url or run_details.get("href", "")
+                if run_url:
+                    context.log.info(f"dbt Cloud run URL: {run_url}")
                 context.log.info(
                     f"Run {self.run_id} status: {status_name} | "
-                    f"run_steps: {len(run_steps)} (ids: {step_ids}) | "
-                    f"Response keys: {list(run_details.keys())}"
+                    f"run_steps: {len(run_steps)} (ids: {step_ids})"
                 )
                 if run_steps:
                     # Try fetching debug logs from the latest step
@@ -483,6 +485,10 @@ class DbtCloudRunMonitor:
                 return new_failures
 
             results_json = self.client.get_run_results_json(self.run_id)
+
+            # Extract invocation_id from metadata
+            invocation_id = results_json.get("metadata", {}).get("invocation_id", "")
+
             for result in results_json.get("results", []):
                 unique_id = result.get("unique_id", "")
                 if unique_id in self._seen_artifact_nodes:
@@ -490,25 +496,50 @@ class DbtCloudRunMonitor:
 
                 self._seen_artifact_nodes.add(unique_id)
                 status = result.get("status", "")
+                exec_time = result.get("execution_time", 0.0)
+                message = result.get("message", "")
+                adapter_response = result.get("adapter_response", {})
+
                 model_result = ModelResult(
                     unique_id=unique_id,
                     status=status,
-                    execution_time=result.get("execution_time", 0.0),
-                    message=result.get("message", ""),
+                    execution_time=exec_time,
+                    message=message,
                     source="artifacts",
                 )
                 self._all_results.append(model_result)
 
+                # Build timing info from result
+                timing = result.get("timing", [])
+                completed_at = ""
+                if timing:
+                    completed_at = timing[-1].get("completed_at", "")
+
+                # Build rich log line matching OOTB metadata quality
+                metadata_parts = [
+                    f"unique_id={unique_id}",
+                    f"status={status}",
+                    f"execution_time={exec_time:.2f}s",
+                ]
+                if invocation_id:
+                    metadata_parts.append(f"invocation_id={invocation_id}")
+                if completed_at:
+                    metadata_parts.append(f"completed_at={completed_at}")
+                if adapter_response:
+                    rows = adapter_response.get("rows_affected", adapter_response.get("_message", ""))
+                    if rows:
+                        metadata_parts.append(f"rows_affected={rows}")
+
+                metadata_str = " | ".join(metadata_parts)
+
                 if status in FAILURE_STATUSES:
                     context.log.error(
-                        f"FAILED (run_results.json): {unique_id} — "
-                        f"{model_result.message}"
+                        f"FAILED: {unique_id} — {message}\n  {metadata_str}"
                     )
                     new_failures.append(model_result)
                 else:
                     context.log.info(
-                        f"OK (run_results.json): {unique_id} "
-                        f"({model_result.execution_time:.1f}s)"
+                        f"OK: {unique_id} ({exec_time:.1f}s)\n  {metadata_str}"
                     )
         except Exception:
             pass

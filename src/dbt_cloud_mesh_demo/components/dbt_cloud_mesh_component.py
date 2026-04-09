@@ -29,15 +29,25 @@ from dbt_cloud_mesh_demo.defs.run_monitor import DbtCloudRunMonitor
 
 
 class _MeshAwareTranslator(DagsterDbtTranslator):
-    """A translator that handles group overrides for dbt mesh projects."""
+    """A translator that handles group overrides and key prefixes."""
 
     def __init__(
         self,
         group_overrides: dict[str, str] | None = None,
+        key_prefix: list[str] | None = None,
         settings: Any | None = None,
     ):
         super().__init__(settings=settings)
         self._group_overrides = group_overrides or {}
+        self._key_prefix = key_prefix or []
+
+    def get_asset_key(
+        self, dbt_resource_props: Mapping[str, Any]
+    ) -> dg.AssetKey:
+        base_key = super().get_asset_key(dbt_resource_props)
+        if self._key_prefix:
+            return base_key.with_prefix(self._key_prefix)
+        return base_key
 
     def get_group_name(
         self, dbt_resource_props: Mapping[str, Any]
@@ -118,6 +128,18 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         ),
     ] = Field(default_factory=dict)
 
+    key_prefix: Annotated[
+        list[str],
+        Resolver.default(
+            description=(
+                "Optional prefix added to all asset keys. Useful for running "
+                "multiple components against the same dbt Cloud project without "
+                "key collisions (e.g. key_prefix: ['ootb'] produces "
+                "AssetKey(['ootb', 'customers']) instead of AssetKey(['customers']))."
+            ),
+        ),
+    ] = Field(default_factory=list)
+
     monitor_runs: Annotated[
         bool,
         Resolver.default(
@@ -163,9 +185,11 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         settings = replace(
             self.translation_settings, enable_code_references=False
         )
-        if self.group_overrides:
+        if self.group_overrides or self.key_prefix:
             return _MeshAwareTranslator(
-                group_overrides=self.group_overrides, settings=settings
+                group_overrides=self.group_overrides,
+                key_prefix=self.key_prefix,
+                settings=settings,
             )
         return DagsterDbtTranslator(settings)
 
@@ -287,8 +311,10 @@ class DbtCloudMeshComponent(DbtCloudComponent):
                     dg.AssetKey([node.get("package_name", ""), node["name"]])
                 )
 
+        prefix = "_".join(self.key_prefix) + "_" if self.key_prefix else ""
+
         @dg.sensor(
-            name=f"mesh_aware_{workspace.project_id}_{workspace.environment_id}_sensor",
+            name=f"{prefix}mesh_aware_{workspace.project_id}_{workspace.environment_id}_sensor",
             description=(
                 f"dbt Cloud polling sensor for project {workspace.project_id} "
                 f"(filters external package models from "
@@ -343,8 +369,10 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         """Build a simple polling sensor for observe mode (no mesh filtering needed)."""
         workspace = self.workspace
 
+        prefix = "_".join(self.key_prefix) + "_" if self.key_prefix else ""
+
         @dg.sensor(
-            name=f"observe_{workspace.project_id}_{workspace.environment_id}_sensor",
+            name=f"{prefix}observe_{workspace.project_id}_{workspace.environment_id}_sensor",
             description=(
                 f"Polls dbt Cloud project {workspace.project_id} for run completions "
                 f"and records asset materializations."
