@@ -519,6 +519,19 @@ class DbtCloudMeshComponent(DbtCloudComponent):
                 context=context,
             )
 
+            # After yielding partial results, raise Failure if there were
+            # errors — matching OOTB behavior where the step fails but
+            # successful model materializations are still recorded.
+            failures = [r for r in monitor._all_results if r.status in ("error", "fail")]
+            if failures:
+                failed_names = ", ".join(f.unique_id for f in failures)
+                from dagster import Failure, MetadataValue
+
+                raise Failure(
+                    f"dbt Cloud run '{run_id}' had {len(failures)} failure(s): {failed_names}",
+                    metadata={"run_id": MetadataValue.int(run_id)},
+                )
+
         return _monitored_dbt_cloud_assets
 
     def _restore_excluded_deps_on_asset_defs(
