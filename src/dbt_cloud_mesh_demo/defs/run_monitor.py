@@ -65,34 +65,43 @@ TERMINAL_STATUSES = {
 
 FAILURE_STATUSES = {"error", "fail"}
 
-# dbt logs model results like:
-#   1 of 50 OK created sql_table_model schema.model_name .... [SELECT 1000 in 3.45s]
-#   2 of 50 ERROR creating sql_table_model schema.model_name
-# We want: the status (OK/ERROR) and the fully qualified model name.
-# The model name always contains a dot (schema.model) and appears after the
-# materialization type keyword.
+# Actual dbt Cloud debug log format (verified against real output):
+#
+# Models:
+#   21:34:34  1 of 21 OK created sql table model JAFFLE_SHOP.customer_metrics ... [\x1b[32mSUCCESS 100\x1b[0m in 0.90s]
+#   21:35:05  18 of 21 ERROR creating sql table model JAFFLE_SHOP.orders_partitioned ... [\x1b[31mERROR\x1b[0m in 0.01s]
+#
+# Tests:
+#   21:34:38  6 of 21 PASS not_null_customer_metrics_customer_id ... [\x1b[32mPASS\x1b[0m in 0.21s]
+#   21:34:39  9 of 21 FAIL 3 not_null_model_col ... [\x1b[31mFAIL 3\x1b[0m in 0.8s]
+#
+# Summary:
+#   21:35:07  Done. PASS=20 WARN=0 ERROR=1 SKIP=0 NO-OP=0 TOTAL=21
+
+# Strip ANSI color codes before parsing
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Model results: "N of M OK created ... SCHEMA.model_name" or "N of M ERROR creating ... SCHEMA.model_name"
+# The model name is SCHEMA.name (contains a dot) and appears after the materialization keywords.
 _MODEL_RESULT_PATTERN = re.compile(
-    r"(\d+)\s+of\s+(\d+)\s+"           # "N of M "
-    r"(OK|ERROR)\s+"                    # status
-    r"(?:created\s+|creating\s+)?"      # optional verb
-    r"\S+\s+"                           # materialization type (sql_table_model, view, etc.)
-    r"(\S+\.\S+)",                      # schema.model_name (must contain a dot)
-    re.IGNORECASE,
+    r"(\d+)\s+of\s+(\d+)\s+"                       # "N of M "
+    r"(OK|ERROR)\s+"                                # status
+    r"(?:created|creating)\s+"                      # verb
+    r"(?:sql\s+)?(?:table|view|incremental)\s+"     # materialization type (may have "sql " prefix)
+    r"(?:model|snapshot|seed)\s+"                    # resource type
+    r"(\S+\.\S+)",                                  # SCHEMA.model_name
 )
 
-# dbt logs test results like:
-#   1 of 10 PASS unique_model_id ............ [PASS in 0.5s]
-#   2 of 10 FAIL 3 not_null_model_col ....... [FAIL 3 in 0.8s]
-#   3 of 10 WARN 1 accepted_values_model_col [WARN 1 in 0.3s]
+# Test results: "N of M PASS test_name" or "N of M FAIL 3 test_name"
+# Test names do NOT contain dots — they're just the test name.
 _TEST_RESULT_PATTERN = re.compile(
-    r"(\d+)\s+of\s+(\d+)\s+"           # "N of M "
-    r"(PASS|FAIL|WARN|SKIP)\s+"         # status
-    r"(?:\d+\s+)?"                      # optional failure count
-    r"(\S+)",                           # test name
-    re.IGNORECASE,
+    r"(\d+)\s+of\s+(\d+)\s+"                       # "N of M "
+    r"(PASS|FAIL|WARN|SKIP)\s+"                     # status
+    r"(?:\d+\s+)?"                                  # optional failure count
+    r"(\S+)",                                       # test name (no dot)
 )
 
-# Runtime errors reference the model explicitly
+# Explicit error patterns that may appear outside the N of M format
 _RUNTIME_ERROR_PATTERN = re.compile(
     r"Runtime Error in model (\S+)",
     re.IGNORECASE,
@@ -197,16 +206,12 @@ class DbtCloudRunMonitor:
             # Try to activate debug log parsing
             if not log_parsing_available:
                 run_steps = run_details.get("run_steps", [])
-                context.log.info(f"run_steps count: {len(run_steps)}")
                 if run_steps:
                     latest_step = max(run_steps, key=lambda s: s.get("index", 0))
                     test_logs = self._fetch_step_debug_logs(latest_step["id"], context)
                     if test_logs:
                         log_parsing_available = True
-                        context.log.info(
-                            f"Debug logs available from step {latest_step['id']} "
-                            f"({len(test_logs)} chars). Per-model log monitoring active."
-                        )
+                        context.log.info("Per-model log monitoring active.")
 
             # 2. Parse debug logs for per-model results (works mid-step)
             log_failures = self._parse_debug_logs_safe(run_details, context)
@@ -336,13 +341,8 @@ class DbtCloudRunMonitor:
             step_data = data.get("data", {})
             debug_logs = step_data.get("debug_logs", "") or ""
             logs = step_data.get("logs", "") or ""
-            context.log.info(
-                f"Step {step_id}: debug_logs={len(debug_logs)} chars, "
-                f"logs={len(logs)} chars"
-            )
             return debug_logs or logs
-        except Exception as e:
-            context.log.info(f"Failed to fetch debug logs for step {step_id}: {e}")
+        except Exception:
             return ""
 
     # -- Debug log parsing (per-model, real-time) ---------------------------
@@ -366,10 +366,9 @@ class DbtCloudRunMonitor:
     ) -> list[ModelResult]:
         """Parse dbt debug logs for per-model success/failure lines.
 
-        Fetches debug logs from the latest/active run step via the steps
-        endpoint. dbt Cloud debug logs are a sliding window (~last 1000 lines),
-        NOT an append-only log. We parse the full window on every call and use
-        _seen_log_nodes for deduplication.
+        Fetches debug logs from run steps via the steps API. Strips ANSI
+        color codes before parsing. Uses _seen_log_nodes for deduplication
+        across polls (debug logs are a sliding window, not append-only).
         """
         new_failures: list[ModelResult] = []
 
@@ -377,9 +376,15 @@ class DbtCloudRunMonitor:
         if not log_text:
             return new_failures
 
+        # Strip ANSI color codes (dbt Cloud logs contain \x1b[32m etc.)
+        log_text = _ANSI_ESCAPE.sub("", log_text)
+
         # Parse model result lines (OK / ERROR)
+        # Must run BEFORE test pattern since test pattern is more general
+        model_names_this_parse: set[str] = set()
         for match in _MODEL_RESULT_PATTERN.finditer(log_text):
             _seq, _total, status_str, model_name = match.groups()
+            model_names_this_parse.add(model_name)
             if model_name in self._seen_log_nodes:
                 continue
             self._seen_log_nodes.add(model_name)
@@ -387,7 +392,7 @@ class DbtCloudRunMonitor:
             is_error = status_str.upper() == "ERROR"
             result = ModelResult(
                 unique_id=model_name,
-                status="error" if is_error else "ok",
+                status="error" if is_error else "success",
                 execution_time=0.0,
                 message=match.group(0).strip(),
                 source="logs",
@@ -395,14 +400,18 @@ class DbtCloudRunMonitor:
             self._all_results.append(result)
 
             if is_error:
-                context.log.error(f"MODEL FAILED: {model_name}")
+                context.log.error(f"MODEL FAILED (logs): {model_name}")
                 new_failures.append(result)
             else:
-                context.log.info(f"Model OK: {model_name}")
+                context.log.info(f"Model OK (logs): {model_name}")
 
         # Parse test result lines (PASS / FAIL / WARN / SKIP)
+        # Skip any match that was already captured by the model pattern
         for match in _TEST_RESULT_PATTERN.finditer(log_text):
             _seq, _total, status_str, test_name = match.groups()
+            # Skip if this looks like a model name (contains dot) — already handled above
+            if "." in test_name:
+                continue
             if test_name in self._seen_log_nodes:
                 continue
             self._seen_log_nodes.add(test_name)
@@ -418,14 +427,14 @@ class DbtCloudRunMonitor:
             self._all_results.append(result)
 
             if is_failure:
-                context.log.error(f"TEST FAILED: {test_name}")
+                context.log.error(f"TEST FAILED (logs): {test_name}")
                 new_failures.append(result)
             elif status_str.upper() == "WARN":
-                context.log.warning(f"Test warning: {test_name}")
+                context.log.warning(f"Test warning (logs): {test_name}")
             else:
-                context.log.info(f"Test {status_str.lower()}: {test_name}")
+                context.log.info(f"Test {status_str.lower()} (logs): {test_name}")
 
-        # Catch explicit error patterns that may not match the N of M format
+        # Catch explicit error patterns outside the N of M format
         for pattern in (_RUNTIME_ERROR_PATTERN, _COMPILATION_ERROR_PATTERN, _DATABASE_ERROR_PATTERN):
             for match in pattern.finditer(log_text):
                 node_name = match.group(1)
@@ -441,7 +450,7 @@ class DbtCloudRunMonitor:
                     source="logs",
                 )
                 self._all_results.append(result)
-                context.log.error(f"ERROR: {match.group(0).strip()}")
+                context.log.error(f"ERROR (logs): {match.group(0).strip()}")
                 new_failures.append(result)
 
         return new_failures
