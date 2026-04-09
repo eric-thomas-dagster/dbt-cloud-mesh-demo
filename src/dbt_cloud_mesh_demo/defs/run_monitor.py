@@ -194,9 +194,10 @@ class DbtCloudRunMonitor:
                 if run_url:
                     context.log.info(f"dbt Cloud run URL: {run_url}")
 
-            # Try to activate debug log parsing on early polls
+            # Try to activate debug log parsing
             if not log_parsing_available:
                 run_steps = run_details.get("run_steps", [])
+                context.log.info(f"run_steps count: {len(run_steps)}")
                 if run_steps:
                     latest_step = max(run_steps, key=lambda s: s.get("index", 0))
                     test_logs = self._fetch_step_debug_logs(latest_step["id"], context)
@@ -270,6 +271,27 @@ class DbtCloudRunMonitor:
 
     # -- Run details fetching -----------------------------------------------
 
+    def _dbt_cloud_get(self, endpoint: str, params: dict | None = None) -> dict:
+        """Make a GET request to the dbt Cloud API.
+
+        Uses requests directly instead of client._make_request to avoid
+        version-specific return type differences in dagster-dbt.
+        """
+        import requests as req
+
+        url = f"{self.client.api_v2_url}/{endpoint}"
+        resp = req.get(
+            url,
+            headers={
+                "Authorization": f"Token {self.client.token}",
+                "Content-Type": "application/json",
+            },
+            params=params,
+            timeout=self.client.request_timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def _get_run_details_safe(
         self, context: AssetExecutionContext
     ) -> dict[str, Any]:
@@ -280,20 +302,21 @@ class DbtCloudRunMonitor:
         fetched separately per-step via _fetch_step_debug_logs.
         """
         try:
-            response = self.client._make_request(
-                method="get",
-                endpoint=f"runs/{self.run_id}",
-                base_url=self.client.api_v2_url,
+            data = self._dbt_cloud_get(
+                f"runs/{self.run_id}",
                 params={"include_related": '["run_steps"]'},
             )
-            return response["data"]
-        except Exception:
-            # Fall back to plain run details without run_steps
+            return data["data"]
+        except Exception as e:
+            context.log.warning(
+                f"include_related request failed: {e}. "
+                f"Falling back to plain run details (no run_steps)."
+            )
             try:
                 return self.client.get_run_details(self.run_id)
-            except Exception as e:
+            except Exception as e2:
                 context.log.warning(
-                    f"Failed to fetch run details for {self.run_id}: {e}"
+                    f"Failed to fetch run details for {self.run_id}: {e2}"
                 )
                 raise
 
@@ -306,16 +329,20 @@ class DbtCloudRunMonitor:
         Returns the step's debug_logs field (truncated to last ~1000 lines).
         """
         try:
-            response = self.client._make_request(
-                method="get",
-                endpoint=f"steps/{step_id}",
-                base_url=self.client.api_v2_url,
+            data = self._dbt_cloud_get(
+                f"steps/{step_id}",
                 params={"include_related": '["debug_logs"]'},
             )
-            step_data = response.get("data", {})
-            return step_data.get("debug_logs", "") or step_data.get("logs", "") or ""
+            step_data = data.get("data", {})
+            debug_logs = step_data.get("debug_logs", "") or ""
+            logs = step_data.get("logs", "") or ""
+            context.log.info(
+                f"Step {step_id}: debug_logs={len(debug_logs)} chars, "
+                f"logs={len(logs)} chars"
+            )
+            return debug_logs or logs
         except Exception as e:
-            context.log.debug(f"Failed to fetch debug logs for step {step_id}: {e}")
+            context.log.info(f"Failed to fetch debug logs for step {step_id}: {e}")
             return ""
 
     # -- Debug log parsing (per-model, real-time) ---------------------------
@@ -532,12 +559,19 @@ class DbtCloudRunMonitor:
 
     def cancel_run(self, context: AssetExecutionContext) -> None:
         """Cancel the dbt Cloud run via the Admin API."""
+        import requests as req
+
         try:
-            self.client._make_request(
-                method="post",
-                endpoint=f"runs/{self.run_id}/cancel/",
-                base_url=self.client.api_v2_url,
+            url = f"{self.client.api_v2_url}/runs/{self.run_id}/cancel/"
+            resp = req.post(
+                url,
+                headers={
+                    "Authorization": f"Token {self.client.token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=self.client.request_timeout,
             )
+            resp.raise_for_status()
             context.log.warning(f"Cancelled dbt Cloud run {self.run_id}")
         except Exception as e:
             context.log.error(f"Failed to cancel run {self.run_id}: {e}")
