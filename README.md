@@ -55,14 +55,27 @@ attributes:
   poll_interval: 5
 ```
 
-When `monitor_runs: true`, Dagster parses dbt Cloud's debug logs every `poll_interval` seconds during execution. Individual model results (OK/ERROR) are logged to the Dagster run log as they happen — not after the entire job finishes. Pair with Dagster+ alerting (Slack/PagerDuty/email) to eliminate manual monitoring of long-running jobs.
+When `monitor_runs: true`, Dagster fetches debug logs from dbt Cloud's steps API every `poll_interval` seconds during execution. Individual model results (OK/ERROR) are logged to the Dagster run log as they happen — not after the entire job finishes. Pair with Dagster+ alerting (Slack/PagerDuty/email) to eliminate manual monitoring of long-running jobs.
 
 Two monitoring modes:
 
 | | `fail_fast: false` (default) | `fail_fast: true` |
 |---|---|---|
 | **On model failure** | Log it immediately, keep the run going | Cancel the dbt Cloud run, fail the Dagster run |
+| **Partial results** | All successful models materialized, failed ones marked failed | Models completed before cancellation materialized |
+| **Step status** | `STEP_FAILURE` (matches OOTB) | `STEP_FAILURE` with cancel confirmation |
 | **Use when** | You want to see ALL failures in one run | Any failure means the output is bad, or you want to save compute |
+
+### How it works under the hood
+
+1. `workspace.cli(["build"])` triggers the dbt Cloud run (handles subset selection for re-execution)
+2. Every `poll_interval` seconds:
+   - `GET /runs/{id}/?include_related=["run_steps"]` for run status and step metadata
+   - `GET /steps/{step_id}/?include_related=["debug_logs"]` for per-model results from dbt's log output
+   - `GET /runs/{id}/artifacts/run_results.json` for structured results when steps complete
+3. Debug logs are stripped of ANSI color codes and parsed with regex for `N of M OK/ERROR` model lines and `PASS/FAIL` test lines
+4. On completion, `DbtCloudJobRunResults.to_default_asset_events()` yields proper Dagster materializations and check evaluations (same as OOTB)
+5. If failures occurred, `dagster.Failure` is raised after yielding partial results (matching OOTB behavior)
 
 ## How dbt Mesh Works with Dagster
 
@@ -294,18 +307,27 @@ attributes:
   poll_interval: 5
 ```
 
-Under the hood, the component fetches debug logs from each run step (via the dbt Cloud steps API) every `poll_interval` seconds and parses them for per-model OK/ERROR results.
+Under the hood, the component fetches debug logs from dbt Cloud's steps API (`GET /steps/{id}/?include_related=["debug_logs"]`) every `poll_interval` seconds and parses them for per-model OK/ERROR results. Uses `requests` directly for API calls (avoids `dagster-dbt` internal API version differences).
 
 - **Per-model granularity**: Detects model results as dbt logs them, not after the run/step completes
 - **Two monitoring modes**: `fail_fast: true` cancels on first failure; `fail_fast: false` logs failures but lets the run continue so you see all errors
+- **Partial result yielding**: Successful models are materialized even when the run has errors — matching OOTB behavior. `dagster.Failure` raised after yielding partials.
+- **ANSI-safe log parsing**: Strips `\x1b[32m` etc. color codes from dbt Cloud debug logs before regex matching
 - **Integrated into the component**: No separate Python asset code required — just YAML config
-- **Configurable poll interval**: Runs inside asset execution (not a sensor), so no minimum interval restriction
-- **Two detection layers**: Debug log parsing (real-time, per-model) + `run_results.json` artifact checking (per-step)
-- **Self-diagnosing**: First poll logs whether debug logs are available in the API response
+- **Re-execute from failure**: Subset materialization works via `workspace.cli()` context — same as OOTB
+- **Cancel endpoint**: `POST /runs/{id}/cancel/` tested and working
+- **`key_prefix` support**: Run multiple components against the same dbt Cloud project without asset key collisions
+- **Namespaced sensors**: Sensor names incorporate `key_prefix` to avoid duplicate definition errors
+
+Tested against real dbt Cloud (Snowflake adapter) with:
+- Fast models, slow models (25s+), compilation errors, database errors
+- `fail_fast: true` — cancel + partial results verified
+- `fail_fast: false` — all failures captured, OOTB parity confirmed
+- Side-by-side comparison with OOTB `DbtCloudComponent`
 
 Use case: Engineers no longer need to manually monitor multi-hour dbt Cloud jobs. Dagster detects failures in seconds and alerts via Dagster+ notifications (Slack/PagerDuty/email).
 
-Known limitation: Debug log parsing relies on dbt's console output format (consistent but not a structured API). dbt Cloud's Discovery API and `run_results.json` only update after run/step completion. For true real-time per-model streaming, use dbt Core via `DbtCliResource`.
+Known limitation: Debug log parsing relies on dbt's console output format (verified against Snowflake adapter). The regex matches `N of M OK/ERROR created ... SCHEMA.model_name` for models and `N of M PASS/FAIL test_name` for tests. Debug logs are only available once a step is RUNNING (not QUEUED/STARTING) and are truncated to ~1000 lines. For true real-time per-model streaming without log parsing, use dbt Core via `DbtCliResource`.
 
 ### Observe vs. Orchestrate mode
 
