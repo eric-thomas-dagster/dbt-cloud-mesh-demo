@@ -186,34 +186,48 @@ class DbtCloudRunMonitor:
             status_name = run.status.name if run.status else "UNKNOWN"
 
             # On first poll, log what monitoring capabilities are available
-            # so we know immediately if debug logs are working.
+            # so we know immediately if the steps API is working.
             if poll_count == 1:
-                log_text = self._extract_log_text(run_details)
-                has_run_steps = bool(run_details.get("run_steps"))
+                run_steps = run_details.get("run_steps", [])
+                step_ids = [s.get("id") for s in run_steps]
                 context.log.info(
                     f"Run {self.run_id} status: {status_name} | "
-                    f"Debug logs available: {bool(log_text)} "
-                    f"({len(log_text)} chars) | "
-                    f"run_steps in response: {has_run_steps} | "
+                    f"run_steps: {len(run_steps)} (ids: {step_ids}) | "
                     f"Response keys: {list(run_details.keys())}"
                 )
-                if not log_text:
+                if run_steps:
+                    # Try fetching debug logs from the latest step
+                    latest_step = max(run_steps, key=lambda s: s.get("index", 0))
+                    test_logs = self._fetch_step_debug_logs(latest_step["id"], context)
+                    if test_logs:
+                        log_parsing_available = True
+                        context.log.info(
+                            f"Debug logs available from step {latest_step['id']} "
+                            f"({len(test_logs)} chars). Per-model monitoring active."
+                        )
+                    else:
+                        context.log.warning(
+                            "run_steps found but debug logs not yet available. "
+                            "Will retry on subsequent polls (logs appear once "
+                            "the step is RUNNING, not QUEUED/STARTING)."
+                        )
+                else:
                     context.log.warning(
-                        "Debug logs not available in API response. "
-                        "Per-model mid-step monitoring will NOT work. "
-                        "Falling back to per-step artifact monitoring only. "
-                        "Will retry log detection on subsequent polls."
+                        "No run_steps in API response yet. "
+                        "Will retry — steps appear once the run starts."
                     )
             elif poll_count <= 5 and not log_parsing_available:
-                # Check again on early polls — logs may not be available
-                # until the run is actually RUNNING (not QUEUED/STARTING)
-                log_text = self._extract_log_text(run_details)
-                if log_text:
-                    log_parsing_available = True
-                    context.log.info(
-                        f"Debug logs now available ({len(log_text)} chars). "
-                        f"Per-model monitoring active."
-                    )
+                # Retry on early polls — logs may not be available until RUNNING
+                run_steps = run_details.get("run_steps", [])
+                if run_steps:
+                    latest_step = max(run_steps, key=lambda s: s.get("index", 0))
+                    test_logs = self._fetch_step_debug_logs(latest_step["id"], context)
+                    if test_logs:
+                        log_parsing_available = True
+                        context.log.info(
+                            f"Debug logs now available ({len(test_logs)} chars). "
+                            f"Per-model monitoring active."
+                        )
             else:
                 context.log.info(f"Run {self.run_id} status: {status_name}")
 
@@ -275,21 +289,22 @@ class DbtCloudRunMonitor:
     def _get_run_details_safe(
         self, context: AssetExecutionContext
     ) -> dict[str, Any]:
-        """Fetch run details, trying to include debug logs.
+        """Fetch run details with run_steps included.
 
-        Falls back to a plain status check if the debug_logs parameter
-        is not supported or fails.
+        The dbt Cloud API returns step metadata (id, index, status) on the
+        run endpoint when include_related=["run_steps"]. Debug logs are
+        fetched separately per-step via _fetch_step_debug_logs.
         """
         try:
             response = self.client._make_request(
                 method="get",
                 endpoint=f"runs/{self.run_id}",
                 base_url=self.client.api_v2_url,
-                params={"include_related": '["run_steps","debug_logs"]'},
+                params={"include_related": '["run_steps"]'},
             )
             return response["data"]
         except Exception:
-            # Fall back to plain run details without debug logs
+            # Fall back to plain run details without run_steps
             try:
                 return self.client.get_run_details(self.run_id)
             except Exception as e:
@@ -297,6 +312,27 @@ class DbtCloudRunMonitor:
                     f"Failed to fetch run details for {self.run_id}: {e}"
                 )
                 raise
+
+    def _fetch_step_debug_logs(
+        self, step_id: int, context: AssetExecutionContext
+    ) -> str:
+        """Fetch debug logs for a specific run step.
+
+        dbt Cloud API: GET /steps/{step_id}/?include_related=["debug_logs"]
+        Returns the step's debug_logs field (truncated to last ~1000 lines).
+        """
+        try:
+            response = self.client._make_request(
+                method="get",
+                endpoint=f"steps/{step_id}",
+                base_url=self.client.api_v2_url,
+                params={"include_related": '["debug_logs"]'},
+            )
+            step_data = response.get("data", {})
+            return step_data.get("debug_logs", "") or step_data.get("logs", "") or ""
+        except Exception as e:
+            context.log.debug(f"Failed to fetch debug logs for step {step_id}: {e}")
+            return ""
 
     # -- Debug log parsing (per-model, real-time) ---------------------------
 
@@ -319,14 +355,14 @@ class DbtCloudRunMonitor:
     ) -> list[ModelResult]:
         """Parse dbt debug logs for per-model success/failure lines.
 
-        dbt Cloud debug logs are a sliding window (~last 1000 lines), NOT an
-        append-only log. We parse the full window on every call and use
-        _seen_log_nodes for deduplication — this handles the window correctly
-        regardless of how it shifts between polls.
+        Fetches debug logs from the latest/active run step via the steps
+        endpoint. dbt Cloud debug logs are a sliding window (~last 1000 lines),
+        NOT an append-only log. We parse the full window on every call and use
+        _seen_log_nodes for deduplication.
         """
         new_failures: list[ModelResult] = []
 
-        log_text = self._extract_log_text(run_details)
+        log_text = self._get_logs_from_steps(run_details, context)
         if not log_text:
             return new_failures
 
@@ -399,24 +435,31 @@ class DbtCloudRunMonitor:
 
         return new_failures
 
-    def _extract_log_text(self, run_details: dict[str, Any]) -> str:
-        """Extract debug log text from run details response.
+    def _get_logs_from_steps(
+        self, run_details: dict[str, Any], context: AssetExecutionContext
+    ) -> str:
+        """Fetch debug logs from each run step via the steps API.
 
-        The debug_logs field location varies by API response shape.
-        Try each known location and concatenate what we find.
+        The dbt Cloud API structure:
+        1. GET /runs/{id}/?include_related=["run_steps"] → list of steps
+        2. GET /steps/{step_id}/?include_related=["debug_logs"] → step logs
+
+        Debug logs live on the step endpoint, not the run endpoint.
+        We fetch logs from all steps and concatenate them.
         """
+        run_steps = run_details.get("run_steps", [])
+        if not run_steps:
+            return ""
+
         parts: list[str] = []
-
-        # Top-level debug_logs (some API versions)
-        if isinstance(run_details.get("debug_logs"), str):
-            parts.append(run_details["debug_logs"])
-
-        # Nested in run_steps (most common)
-        for step in run_details.get("run_steps", []):
-            for key in ("debug_logs", "logs"):
-                val = step.get(key)
-                if isinstance(val, str) and val:
-                    parts.append(val)
+        # Sort by index to process steps in order
+        for step in sorted(run_steps, key=lambda s: s.get("index", 0)):
+            step_id = step.get("id")
+            if not step_id:
+                continue
+            log_text = self._fetch_step_debug_logs(step_id, context)
+            if log_text:
+                parts.append(log_text)
 
         return "\n".join(parts)
 
