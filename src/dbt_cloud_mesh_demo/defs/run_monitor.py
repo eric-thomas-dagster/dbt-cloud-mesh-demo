@@ -185,53 +185,27 @@ class DbtCloudRunMonitor:
             run = DbtCloudRun.from_run_details(run_details)
             status_name = run.status.name if run.status else "UNKNOWN"
 
-            # On first poll, log what monitoring capabilities are available
-            # so we know immediately if the steps API is working.
+            # Log status on every poll so the user can see we're alive
+            context.log.info(f"Run {self.run_id} status: {status_name}")
+
+            # On first poll, log run URL and check monitoring capabilities
             if poll_count == 1:
-                run_steps = run_details.get("run_steps", [])
-                step_ids = [s.get("id") for s in run_steps]
                 run_url = run.url or run_details.get("href", "")
                 if run_url:
                     context.log.info(f"dbt Cloud run URL: {run_url}")
-                context.log.info(
-                    f"Run {self.run_id} status: {status_name} | "
-                    f"run_steps: {len(run_steps)} (ids: {step_ids})"
-                )
+
+            # Try to activate debug log parsing on early polls
+            if not log_parsing_available:
+                run_steps = run_details.get("run_steps", [])
                 if run_steps:
-                    # Try fetching debug logs from the latest step
                     latest_step = max(run_steps, key=lambda s: s.get("index", 0))
                     test_logs = self._fetch_step_debug_logs(latest_step["id"], context)
                     if test_logs:
                         log_parsing_available = True
                         context.log.info(
                             f"Debug logs available from step {latest_step['id']} "
-                            f"({len(test_logs)} chars). Per-model monitoring active."
+                            f"({len(test_logs)} chars). Per-model log monitoring active."
                         )
-                    else:
-                        context.log.warning(
-                            "run_steps found but debug logs not yet available. "
-                            "Will retry on subsequent polls (logs appear once "
-                            "the step is RUNNING, not QUEUED/STARTING)."
-                        )
-                else:
-                    context.log.warning(
-                        "No run_steps in API response yet. "
-                        "Will retry — steps appear once the run starts."
-                    )
-            elif poll_count <= 5 and not log_parsing_available:
-                # Retry on early polls — logs may not be available until RUNNING
-                run_steps = run_details.get("run_steps", [])
-                if run_steps:
-                    latest_step = max(run_steps, key=lambda s: s.get("index", 0))
-                    test_logs = self._fetch_step_debug_logs(latest_step["id"], context)
-                    if test_logs:
-                        log_parsing_available = True
-                        context.log.info(
-                            f"Debug logs now available ({len(test_logs)} chars). "
-                            f"Per-model monitoring active."
-                        )
-            else:
-                context.log.info(f"Run {self.run_id} status: {status_name}")
 
             # 2. Parse debug logs for per-model results (works mid-step)
             log_failures = self._parse_debug_logs_safe(run_details, context)
@@ -537,12 +511,12 @@ class DbtCloudRunMonitor:
 
                 if status in FAILURE_STATUSES:
                     context.log.error(
-                        f"FAILED: {unique_id} — {message}\n  {metadata_str}"
+                        f"FAILED: {unique_id} — {message} [{metadata_str}]"
                     )
                     new_failures.append(model_result)
                 else:
                     context.log.info(
-                        f"OK: {unique_id} ({exec_time:.1f}s)\n  {metadata_str}"
+                        f"OK: {unique_id} ({exec_time:.1f}s) [{metadata_str}]"
                     )
         except Exception:
             pass
