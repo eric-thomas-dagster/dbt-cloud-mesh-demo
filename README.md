@@ -77,11 +77,28 @@ Two monitoring modes:
 4. On completion, `DbtCloudJobRunResults.to_default_asset_events()` yields proper Dagster materializations and check evaluations (same as OOTB)
 5. If failures occurred, `dagster.Failure` is raised after yielding partial results (matching OOTB behavior)
 
+## What is dbt Mesh?
+
+dbt Mesh is a multi-project architecture pattern in dbt Cloud (Enterprise and Enterprise+ plans) that allows separate dbt projects to reference each other's models. Instead of one monolithic dbt project, teams split their transformations into independent projects (e.g. silver and gold) that share data products via cross-project `{{ ref() }}` calls.
+
+Key features:
+- **Cross-project references**: `{{ ref('silver_project', 'customers') }}` in the gold project resolves to the silver project's `customers` model
+- **Public models**: Only models marked `access: public` can be referenced across projects
+- **Model contracts**: Enforce data shape expectations at project boundaries
+- **Independent deployment**: Each project has its own dbt Cloud jobs, environments, and deployment schedules
+
+When two projects use mesh, the downstream project's manifest contains **both** its own models and references to the upstream project's public models. A dbt Cloud run of the downstream project may execute or reference upstream models depending on the configuration.
+
+For more details, see [dbt Mesh documentation](https://docs.getdbt.com/best-practices/how-we-mesh/mesh-1-intro).
+
 ## How dbt Mesh Works with Dagster
 
-When two dbt projects use dbt mesh, the downstream project (gold) pulls in upstream models (silver) via `packages.yml`. This means the gold project's manifest contains **both** gold and silver models. Dagster needs to handle this correctly to avoid duplicate assets while preserving lineage.
+In Dagster, each dbt Cloud project becomes a component that produces assets. With dbt mesh, the downstream project's manifest includes upstream models, which creates two challenges:
 
-The key insight: **`exclude: "package:silver_project"` on the gold component prevents duplicate assets, and the dependency edges from gold models to silver asset keys are preserved.** Dagster resolves those dependencies to the real silver assets regardless of whether they live in the same or different code locations.
+1. **Duplicate assets**: Both the silver and gold components would try to create assets for silver models
+2. **Sensor cross-contamination**: The gold sensor would emit materialization events for silver models included in gold run results
+
+The solution: `exclude: "package:silver_project"` on the gold component prevents silver models from becoming gold assets, and the `DbtCloudMeshComponent`'s mesh-aware sensor filters out cross-project materialization events. Dependency edges from gold models to silver asset keys are preserved — Dagster resolves them to the silver component's actual assets.
 
 ## Why the OOTB DbtCloudComponent Doesn't Work for dbt Mesh
 
