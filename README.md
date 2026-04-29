@@ -159,10 +159,10 @@ With `DbtProjectComponent` (dbt Core), Dagster runs dbt directly via CLI and con
 
 ### The Fix: DbtCloudMeshComponent
 
-This project includes a `DbtCloudMeshComponent` that solves the sensor problem for multi-code-location deployments by replacing the standard polling sensor with a **mesh-aware sensor** that filters out materialization events for models belonging to external packages.
+The `DbtCloudMeshComponent` solves the sensor problem by replacing the standard polling sensor with a **mesh-aware sensor** that filters out materialization events for models belonging to external packages. Use it for all dbt mesh deployments regardless of code location setup.
 
 ```yaml
-# gold_cloud/defs.yaml (multi-code-location)
+# gold_cloud/defs.yaml
 type: dbt_cloud_mesh_demo.components.dbt_cloud_mesh_component.DbtCloudMeshComponent
 attributes:
   workspace:
@@ -178,11 +178,13 @@ attributes:
       group_name: "silver"
 ```
 
-The `external_packages` config tells the mesh-aware sensor which packages to filter. The silver code location's own sensor handles silver model materializations independently.
+The `external_packages` config tells the mesh-aware sensor which packages to filter. The silver component's own sensor handles silver model materializations independently.
 
-### Additional Feature: group_overrides
+### Cross-layer lineage (group_overrides)
 
-The `DbtCloudMeshComponent` also supports `group_overrides` for assigning Dagster groups from YAML when the dbt project doesn't define them:
+For lineage to wire up across layers (bronze → silver → gold), the asset keys produced by each component must match. By default, the dbt translator generates asset keys from the dbt model name — but upstream assets from other systems (e.g. Databricks bronze tables) or other dbt projects may use different key structures.
+
+`group_overrides` assigns Dagster groups from YAML based on dbt resource types or fqn path segments. This helps organize assets into the correct groups for visual clarity in the asset graph, and ensures that models in different layers are visually grouped correctly:
 
 ```yaml
   group_overrides:
@@ -192,7 +194,9 @@ The `DbtCloudMeshComponent` also supports `group_overrides` for assigning Dagste
     gold: gold
 ```
 
-Matches by resource type first (e.g. `seed`), then by fqn path segment (e.g. `staging`). Falls back to the dbt-defined group if no override matches.
+Matches by resource type first (e.g. `seed`), then by each fqn path segment (e.g. `staging`, `silver`). Falls back to the dbt-defined group if no override matches.
+
+For more complex key mapping — like mapping dbt sources to existing Dagster assets from Databricks or another system — a custom translator override on `get_asset_key` is needed. The `kdp_dagster` project demonstrates this pattern: the silver translator maps `source.bronze.*` to `AssetKey(["bronze", table_name])` to match Databricks assets, and the gold translator prefixes silver package models with `"silver"` to match the silver component's keys. This ensures the full bronze → silver → gold lineage connects in the asset graph.
 
 ## Setup for Your dbt Cloud Account
 
