@@ -83,13 +83,36 @@ When two dbt projects use dbt mesh, the downstream project (gold) pulls in upstr
 
 The key insight: **`exclude: "package:silver_project"` on the gold component prevents duplicate assets, and the dependency edges from gold models to silver asset keys are preserved.** Dagster resolves those dependencies to the real silver assets regardless of whether they live in the same or different code locations.
 
-## Single Code Location (Recommended)
+## Why the OOTB DbtCloudComponent Doesn't Work for dbt Mesh
 
-If both dbt Cloud projects live in the **same Dagster code location**, use the standard `DbtCloudComponent` with no custom code:
+The standard `DbtCloudComponent` has a **sensor problem** that affects all dbt mesh deployments — single code location or multi-code-location.
+
+When two dbt Cloud projects use dbt mesh, the downstream project's (gold) run results include models from the upstream project (silver) — because dbt mesh pulls them into execution via packages. The OOTB polling sensor processes **all** run results and emits `AssetMaterialization` events for every successful model, including the upstream models.
+
+This causes **double materialization of upstream assets**:
+
+- Silver sensor materializes silver assets from silver runs ✓
+- Gold sensor **also** materializes silver assets from gold runs ✗
+
+The result:
+- Silver asset freshness timestamps get overwritten by gold run timing
+- Silver assets appear "materialized" even if only the gold run completed
+- Automation conditions based on freshness fire incorrectly
+- Run history shows silver assets materialized by both sensors
+
+In **multi-code-location** deployments, it's worse — the gold sensor crashes entirely because `sorted_asset_events` tries to look up silver asset keys in the gold code location's toposorted list, and they don't exist:
+
+```
+AssetKey(['evaluator', 'base_exposure_relationships']) is not in list
+```
+
+**Use `DbtCloudMeshComponent` for any dbt mesh deployment.** It includes a mesh-aware sensor that filters out materialization events for external package models, preventing both the double-materialization problem (single code location) and the sensor crash (multi-code-location).
+
+## Single Code Location
 
 ```yaml
 # silver_cloud/defs.yaml
-type: dagster_dbt.DbtCloudComponent
+type: dbt_cloud_mesh_demo.components.dbt_cloud_mesh_component.DbtCloudMeshComponent
 attributes:
   workspace:
     account_id: 12345
@@ -101,7 +124,7 @@ attributes:
 
 ```yaml
 # gold_cloud/defs.yaml
-type: dagster_dbt.DbtCloudComponent
+type: dbt_cloud_mesh_demo.components.dbt_cloud_mesh_component.DbtCloudMeshComponent
 attributes:
   workspace:
     account_id: 12345
@@ -115,10 +138,8 @@ attributes:
 This works because:
 
 - **No duplicate assets.** The silver component creates assets for silver models. The gold component's `exclude` prevents creating them again.
-- **Lineage is preserved.** `exclude` only prevents silver models from becoming assets in the gold component - it does **not** strip the dependency edges. Gold models like `customer_360` still have `deps=[AssetKey(["customers"])]`, which resolves to the silver component's real asset.
-- **The polling sensor just works.** When the gold sensor emits materializations for silver models (included in run results via dbt packages), those asset keys exist in the code location's asset graph from the silver component, so the sensor's toposort lookup succeeds.
-
-No custom component, no external assets, no sensor filtering needed.
+- **Lineage is preserved.** `exclude` only prevents silver models from becoming assets in the gold component — it does **not** strip the dependency edges. Gold models still have `deps` pointing to silver asset keys.
+- **The mesh-aware sensor filters correctly.** When the gold run completes with silver models in the results, the sensor only emits materializations for gold assets. Silver materializations are dropped — the silver sensor handles those independently.
 
 ## Multi-Code-Location Deployments
 
