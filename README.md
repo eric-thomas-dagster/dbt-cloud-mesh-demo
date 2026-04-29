@@ -196,7 +196,7 @@ For lineage to wire up across layers (bronze → silver → gold), the asset key
 
 Matches by resource type first (e.g. `seed`), then by each fqn path segment (e.g. `staging`, `silver`). Falls back to the dbt-defined group if no override matches.
 
-For more complex key mapping — like mapping dbt sources to existing Dagster assets from Databricks or another system — a custom translator override on `get_asset_key` is needed. The `kdp_dagster` project demonstrates this pattern: the silver translator maps `source.bronze.*` to `AssetKey(["bronze", table_name])` to match Databricks assets, and the gold translator prefixes silver package models with `"silver"` to match the silver component's keys. This ensures the full bronze → silver → gold lineage connects in the asset graph.
+For more complex key mapping — like mapping dbt sources to existing Dagster assets from Databricks or another system — override `get_asset_key` on a custom translator. For example, a silver project's translator can map `source.bronze.*` to `AssetKey(["bronze", table_name])` to match upstream Databricks assets, and a gold project's translator can prefix silver package models to match the silver component's keys. This ensures the full bronze → silver → gold lineage connects in the asset graph.
 
 ## Setup for Your dbt Cloud Account
 
