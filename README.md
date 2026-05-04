@@ -25,6 +25,18 @@ attributes:
 
 Assets appear in the Dagster asset graph with full lineage. When dbt Cloud runs complete externally, the polling sensor detects them and records materializations in Dagster. You get run history, metadata, and cross-project lineage without Dagster triggering anything.
 
+### Failure visibility via automatic check evaluations
+
+The OOTB dbt Cloud sensor only emits `AssetMaterialization` events for successful models. Failed models produce no signal in Dagster — they just look "stale" with no indication that something broke.
+
+The `DbtCloudMeshComponent`'s sensors (both mesh-aware and observe) automatically emit `AssetCheckEvaluation` events for **every** model result — success or failure. This is transparent to the user; no additional configuration is needed.
+
+For each model in a completed dbt Cloud run:
+- **Success**: `AssetMaterialization` (asset materialized) + `AssetCheckEvaluation` with `passed=True` on the `dbt_cloud_run_status` check
+- **Failure**: `AssetCheckEvaluation` with `passed=False` on the `dbt_cloud_run_status` check — the asset shows a **degraded check** in the Dagster UI with the dbt error message, status, and run URL in metadata
+
+This works in both observe and orchestrate modes (when `create_sensor: true`). Dagster+ alerting can be configured on check failures to notify engineers immediately when a dbt Cloud model fails — even when Dagster isn't triggering the runs.
+
 ### Orchestrate mode
 
 ```yaml
