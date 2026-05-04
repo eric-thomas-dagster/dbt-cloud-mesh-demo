@@ -14,6 +14,7 @@ may drop both the asset AND the dependency edges, breaking cross-project lineage
 
 import json
 from collections.abc import Mapping
+from datetime import timedelta
 from functools import cached_property
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -21,8 +22,12 @@ from typing import Annotated, Any, Literal
 import dagster as dg
 from dagster.components.resolved.model import Resolver
 from dagster_dbt import DagsterDbtTranslator, DbtCloudComponent
-from dagster_dbt.asset_utils import get_node, get_upstream_unique_ids
+from dagster_dbt.asset_utils import build_dbt_specs, get_node, get_upstream_unique_ids
 from dagster_dbt.cloud_v2.resources import DbtCloudWorkspace
+from dagster_dbt.cloud_v2.run_handler import DbtCloudJobRunResults
+from dagster_dbt.cloud_v2.types import DbtCloudRun
+from dagster_dbt.compat import REFABLE_NODE_TYPES, NodeStatus
+from dagster_shared.serdes import deserialize_value, serialize_value
 from pydantic import Field
 
 from dbt_cloud_mesh_demo.defs.run_monitor import DbtCloudRunMonitor
@@ -297,7 +302,12 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         workspace: DbtCloudWorkspace,
         manifest: Mapping[str, Any],
     ) -> dg.SensorDefinition:
-        """Build a polling sensor that filters out external package materializations."""
+        """Build a polling sensor that filters external packages and emits check evaluations.
+
+        Unlike the OOTB sensor which only emits AssetMaterialization for successes,
+        this sensor also emits AssetCheckEvaluation for every model result — so
+        failed models show a degraded check in the Dagster UI.
+        """
         external_node_ids = self._get_excluded_node_ids(manifest)
 
         external_asset_keys: set[dg.AssetKey] = set()
@@ -312,21 +322,119 @@ class DbtCloudMeshComponent(DbtCloudComponent):
                 )
 
         prefix = "_".join(self.key_prefix) + "_" if self.key_prefix else ""
+        translator = self.translator
+        captured_manifest = manifest
 
         @dg.sensor(
             name=f"{prefix}mesh_aware_{workspace.project_id}_{workspace.environment_id}_sensor",
             description=(
-                f"dbt Cloud polling sensor for project {workspace.project_id} "
-                f"(filters external package models from "
-                f"{', '.join(self._get_excluded_package_names())})"
+                f"dbt Cloud polling sensor for project {workspace.project_id}. "
+                f"Emits materializations for successes and check evaluations for "
+                f"all model results (including failures)."
             ),
             minimum_interval_seconds=30,
             default_status=dg.DefaultSensorStatus.RUNNING,
         )
-        def mesh_aware_sensor(context: dg.SensorEvaluationContext) -> dg.SkipReason:
-            return dg.SkipReason(
-                "Mesh-aware sensor placeholder. Connect to dbt Cloud for full functionality."
+        def mesh_aware_sensor(context: dg.SensorEvaluationContext) -> dg.SensorResult:
+            from dagster._time import get_current_datetime
+
+            # Cursor management — track last seen timestamp
+            cursor_timestamp = float(context.cursor) if context.cursor else None
+            current_time = get_current_datetime()
+
+            if cursor_timestamp is None:
+                # First run: look back 60 seconds
+                lower_bound = (current_time - timedelta(seconds=60)).timestamp()
+            else:
+                lower_bound = cursor_timestamp
+
+            upper_bound = current_time.timestamp()
+
+            client = workspace.get_client()
+            workspace_data = workspace.get_or_fetch_workspace_data()
+
+            from dagster._time import datetime_from_timestamp
+
+            runs, _total = client.get_runs_batch(
+                project_id=workspace.project_id,
+                environment_id=workspace.environment_id,
+                finished_at_lower_bound=datetime_from_timestamp(lower_bound),
+                finished_at_upper_bound=datetime_from_timestamp(upper_bound),
+                offset=0,
             )
+
+            all_events: list[dg.AssetMaterialization | dg.AssetCheckEvaluation] = []
+
+            for run_details in runs:
+                run = DbtCloudRun.from_run_details(run_details)
+
+                # Skip Dagster-triggered runs
+                if run.job_definition_id == workspace_data.adhoc_job_id:
+                    continue
+
+                run_artifacts = client.list_run_artifacts(run_id=run.id)
+                if "run_results.json" not in run_artifacts:
+                    continue
+
+                run_results_json = client.get_run_results_json(run_id=run.id)
+                invocation_id = run_results_json.get("metadata", {}).get("invocation_id", "")
+
+                for result in run_results_json.get("results", []):
+                    unique_id = result.get("unique_id", "")
+                    node = captured_manifest.get("nodes", {}).get(unique_id)
+                    if not node:
+                        continue
+
+                    resource_type = node.get("resource_type", "")
+                    if resource_type not in REFABLE_NODE_TYPES:
+                        continue
+
+                    asset_key = translator.get_asset_key(node)
+
+                    # Filter out external package models
+                    if asset_key in external_asset_keys:
+                        continue
+
+                    result_status = result.get("status", "")
+                    exec_time = result.get("execution_time", 0.0)
+                    message = result.get("message", "")
+
+                    metadata = {
+                        "unique_id": unique_id,
+                        "invocation_id": invocation_id,
+                        "execution_duration": exec_time,
+                    }
+                    if run.url:
+                        metadata["run_url"] = dg.MetadataValue.url(run.url)
+
+                    # Emit materialization for successful models
+                    if result_status == NodeStatus.Success:
+                        all_events.append(
+                            dg.AssetMaterialization(
+                                asset_key=asset_key,
+                                metadata=metadata,
+                            )
+                        )
+
+                    # Emit check evaluation for ALL models — success or failure.
+                    # This makes failed models show a degraded check in the UI.
+                    all_events.append(
+                        dg.AssetCheckEvaluation(
+                            asset_key=asset_key,
+                            check_name="dbt_cloud_run_status",
+                            passed=result_status == NodeStatus.Success,
+                            metadata={
+                                **metadata,
+                                "status": result_status,
+                                "message": message,
+                            },
+                            severity=dg.AssetCheckSeverity.ERROR,
+                        )
+                    )
+
+            context.update_cursor(str(upper_bound))
+            context.log.info(f"Emitting {len(all_events)} events from {len(runs)} runs")
+            return dg.SensorResult(asset_events=all_events)
 
         return mesh_aware_sensor
 
@@ -366,24 +474,90 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         )
 
     def _build_observe_sensor(self) -> dg.SensorDefinition:
-        """Build a simple polling sensor for observe mode (no mesh filtering needed)."""
+        """Build a polling sensor with check evaluations (no mesh filtering)."""
         workspace = self.workspace
+        translator = self.translator
 
         prefix = "_".join(self.key_prefix) + "_" if self.key_prefix else ""
 
         @dg.sensor(
             name=f"{prefix}observe_{workspace.project_id}_{workspace.environment_id}_sensor",
             description=(
-                f"Polls dbt Cloud project {workspace.project_id} for run completions "
-                f"and records asset materializations."
+                f"Polls dbt Cloud project {workspace.project_id} for run completions. "
+                f"Emits materializations for successes and check evaluations for all results."
             ),
             minimum_interval_seconds=30,
             default_status=dg.DefaultSensorStatus.RUNNING,
         )
-        def observe_sensor(context: dg.SensorEvaluationContext) -> dg.SkipReason:
-            return dg.SkipReason(
-                "Observe sensor placeholder. Connect to dbt Cloud for full functionality."
+        def observe_sensor(context: dg.SensorEvaluationContext) -> dg.SensorResult:
+            from dagster._time import datetime_from_timestamp, get_current_datetime
+
+            cursor_timestamp = float(context.cursor) if context.cursor else None
+            current_time = get_current_datetime()
+            lower_bound = cursor_timestamp or (current_time - timedelta(seconds=60)).timestamp()
+            upper_bound = current_time.timestamp()
+
+            client = workspace.get_client()
+            workspace_data = workspace.get_or_fetch_workspace_data()
+
+            runs, _total = client.get_runs_batch(
+                project_id=workspace.project_id,
+                environment_id=workspace.environment_id,
+                finished_at_lower_bound=datetime_from_timestamp(lower_bound),
+                finished_at_upper_bound=datetime_from_timestamp(upper_bound),
+                offset=0,
             )
+
+            all_events: list[dg.AssetMaterialization | dg.AssetCheckEvaluation] = []
+
+            for run_details in runs:
+                run = DbtCloudRun.from_run_details(run_details)
+                if run.job_definition_id == workspace_data.adhoc_job_id:
+                    continue
+
+                run_artifacts = client.list_run_artifacts(run_id=run.id)
+                if "run_results.json" not in run_artifacts:
+                    continue
+
+                run_results_json = client.get_run_results_json(run_id=run.id)
+                invocation_id = run_results_json.get("metadata", {}).get("invocation_id", "")
+
+                for result in run_results_json.get("results", []):
+                    unique_id = result.get("unique_id", "")
+                    node = workspace_data.manifest.get("nodes", {}).get(unique_id)
+                    if not node:
+                        continue
+                    if node.get("resource_type", "") not in REFABLE_NODE_TYPES:
+                        continue
+
+                    asset_key = translator.get_asset_key(node)
+                    result_status = result.get("status", "")
+                    metadata = {
+                        "unique_id": unique_id,
+                        "invocation_id": invocation_id,
+                        "execution_duration": result.get("execution_time", 0.0),
+                    }
+                    if run.url:
+                        metadata["run_url"] = dg.MetadataValue.url(run.url)
+
+                    if result_status == NodeStatus.Success:
+                        all_events.append(
+                            dg.AssetMaterialization(asset_key=asset_key, metadata=metadata)
+                        )
+
+                    all_events.append(
+                        dg.AssetCheckEvaluation(
+                            asset_key=asset_key,
+                            check_name="dbt_cloud_run_status",
+                            passed=result_status == NodeStatus.Success,
+                            metadata={**metadata, "status": result_status, "message": result.get("message", "")},
+                            severity=dg.AssetCheckSeverity.ERROR,
+                        )
+                    )
+
+            context.update_cursor(str(upper_bound))
+            context.log.info(f"Emitting {len(all_events)} events from {len(runs)} runs")
+            return dg.SensorResult(asset_events=all_events)
 
         return observe_sensor
 
