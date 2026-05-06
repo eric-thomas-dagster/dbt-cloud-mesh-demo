@@ -751,29 +751,25 @@ class DbtCloudMeshComponent(DbtCloudComponent):
                 if run.url:
                     context.log.info(f"dbt Cloud run URL: {run.url}")
 
-                # Poll for completion — cancel on Dagster run termination
-                import requests as req
-
-                run_completed = False
-                try:
-                    client.poll_run(run.id)
-                    run_completed = True
-                finally:
-                    if not run_completed:
-                        context.log.warning(
-                            f"Dagster run terminated. Cancelling dbt Cloud run {run.id}."
-                        )
-                        try:
-                            req.post(
-                                f"{client.api_v2_url}/runs/{run.id}/cancel/",
-                                headers={
-                                    "Authorization": f"Token {client.token}",
-                                    "Content-Type": "application/json",
-                                },
-                                timeout=client.request_timeout,
-                            )
-                        except Exception:
-                            pass
+                # Use the monitor for mid-run logging + cancellation on termination.
+                # We consume the stream but don't yield per-model events — there's
+                # only one Output for the job-level asset. The stream still logs
+                # per-model OK/ERROR to context.log, and the try/finally inside
+                # stream() cancels the dbt Cloud run if Dagster is terminated.
+                monitor = DbtCloudRunMonitor(
+                    client=client,
+                    run_id=run.id,
+                    poll_interval=poll_interval,
+                    fail_fast=fail_fast,
+                )
+                # Consume stream — per-model events are discarded, but logging
+                # and cancellation still work
+                for _event in monitor.stream(
+                    context=context,
+                    manifest=workspace.get_or_fetch_workspace_data().manifest,
+                    dagster_dbt_translator=translator,
+                ):
+                    pass  # discard per-model events for job-level asset
 
                 metadata: dict[str, Any] = {"dbt_cloud/run_id": run.id, "dbt_cloud/job_id": job_id}
                 if run.url:
