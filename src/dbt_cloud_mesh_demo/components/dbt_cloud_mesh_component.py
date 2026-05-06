@@ -202,13 +202,30 @@ class DbtCloudMeshComponent(DbtCloudComponent):
             description=(
                 "'model': Each dbt model is a separate Dagster asset with full "
                 "lineage (default). "
-                "'job': The entire dbt Cloud workspace is a single Dagster asset, "
-                "like how Fivetran/Airbyte connectors appear as one asset. "
+                "'job': Each dbt Cloud job is a separate Dagster asset. "
                 "Internal model lineage stays in dbt Cloud. Simpler for teams "
                 "that don't need per-model orchestration in Dagster."
             ),
         ),
     ] = "model"
+
+    job_deps: Annotated[
+        dict[str, list[list[str]]],
+        Resolver.default(
+            description=(
+                "Per-job upstream dependencies when asset_granularity is 'job'. "
+                "Maps job names to lists of upstream asset key paths. "
+                "Example: {silver_build: [['fivetran', 'my_connector']], "
+                "gold_build: [['silver_build']]}"
+            ),
+            examples=[
+                {
+                    "silver_build": [["fivetran", "my_connector"]],
+                    "gold_build": [["silver_build"]],
+                },
+            ],
+        ),
+    ] = Field(default_factory=dict)
 
     @cached_property
     def translator(self) -> DagsterDbtTranslator:
@@ -685,8 +702,18 @@ class DbtCloudMeshComponent(DbtCloudComponent):
             safe_name = job_name.lower().replace(" ", "_").replace("-", "_")
             asset_key = dg.AssetKey([*prefix, safe_name])
 
+            # Build deps from job_deps config
+            deps: list[dg.AssetDep] = []
+            for dep_key_path in self.job_deps.get(job_name, []):
+                deps.append(dg.AssetDep(asset=dg.AssetKey(dep_key_path)))
+            # Also check safe_name in case user uses the sanitized version
+            if safe_name != job_name:
+                for dep_key_path in self.job_deps.get(safe_name, []):
+                    deps.append(dg.AssetDep(asset=dg.AssetKey(dep_key_path)))
+
             job_specs.append(dg.AssetSpec(
                 key=asset_key,
+                deps=deps,
                 group_name=group_name,
                 description=job.get("description", f"dbt Cloud job: {job_name}"),
                 metadata={
