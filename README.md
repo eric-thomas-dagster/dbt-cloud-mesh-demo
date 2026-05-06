@@ -78,6 +78,61 @@ Two monitoring modes:
 | **Step status** | `STEP_FAILURE` (matches OOTB) | `STEP_FAILURE` with cancel confirmation |
 | **Use when** | You want to see ALL failures in one run | Any failure means the output is bad, or you want to save compute |
 
+### Virtual assets for views (materialize_views)
+
+dbt views don't persist data — they're just SQL definitions over upstream tables. By default, Dagster treats them as materializable assets, which triggers unnecessary dbt Cloud runs. Set `materialize_views: false` to mark views as virtual assets:
+
+```yaml
+attributes:
+  materialize_views: false
+```
+
+Virtual view assets appear in the lineage graph but are never materialized. Dagster skips them during execution and resolves dependencies through them to the next non-virtual ancestor. This saves compute without losing visibility.
+
+### Job-level assets (asset_granularity)
+
+Instead of exposing every dbt model as a Dagster asset, treat each dbt Cloud job as a single asset — like how Fivetran or Airbyte connectors appear as one asset. Internal model lineage stays in dbt Cloud.
+
+```yaml
+attributes:
+  asset_granularity: job
+  mode: orchestrate   # or observe
+```
+
+Jobs are discovered automatically from the dbt Cloud workspace API. Each job becomes a separate Dagster asset with metadata (job ID, job name, project, environment).
+
+#### Wiring job dependencies (job_deps)
+
+Use `job_deps` to declare upstream dependencies per job, enabling cross-tool pipelines:
+
+```yaml
+# Silver workspace — silver job depends on Fivetran sync
+attributes:
+  asset_granularity: job
+  mode: orchestrate
+  job_deps:
+    silver_build:
+      - ["fivetran", "my_connector"]
+```
+
+```yaml
+# Gold workspace — gold job depends on silver job
+attributes:
+  asset_granularity: job
+  mode: orchestrate
+  job_deps:
+    gold_build:
+      - ["silver_build"]
+```
+
+Dagster sees the full pipeline: `fivetran/my_connector → silver_build → gold_build`. Materializing `gold_build` triggers upstream dependencies first. Each job can be materialized independently (subsettable).
+
+Job-level sensors emit `AssetCheckEvaluation` for each completed run, so failures show as degraded checks — same as model-level mode.
+
+### Cancellation on Dagster run termination
+
+When a Dagster run is cancelled (e.g. user clicks cancel in the UI), the component automatically cancels the in-progress dbt Cloud run so it doesn't keep consuming compute. This applies to both model-level and job-level modes in orchestrate.
+
 ### How it works under the hood
 
 1. `workspace.cli(["build"])` triggers the dbt Cloud run (handles subset selection for re-execution)
