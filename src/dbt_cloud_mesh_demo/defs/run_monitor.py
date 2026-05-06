@@ -120,73 +120,87 @@ class DbtCloudRunMonitor:
         # Build lookup: "SCHEMA.model_name" (lowered) → unique_id
         log_name_to_unique_id = self._build_log_name_lookup(manifest)
 
-        while True:
-            poll_count += 1
-            if timeout and (time.time() - start_time) > timeout:
-                raise TimeoutError(f"dbt Cloud run {self.run_id} timed out after {timeout}s")
+        # Track whether the dbt Cloud run reached a terminal state.
+        # If the generator is closed before that (Dagster run cancelled),
+        # the finally block cancels the dbt Cloud run so it doesn't keep
+        # consuming compute.
+        run_completed = False
+        try:
+            while True:
+                poll_count += 1
+                if timeout and (time.time() - start_time) > timeout:
+                    raise TimeoutError(f"dbt Cloud run {self.run_id} timed out after {timeout}s")
 
-            # 1. Get run status
-            run_details = self._get_run_details_safe(context)
-            run = DbtCloudRun.from_run_details(run_details)
-            status_name = run.status.name if run.status else "UNKNOWN"
-            context.log.info(f"Run {self.run_id} status: {status_name}")
+                # 1. Get run status
+                run_details = self._get_run_details_safe(context)
+                run = DbtCloudRun.from_run_details(run_details)
+                status_name = run.status.name if run.status else "UNKNOWN"
+                context.log.info(f"Run {self.run_id} status: {status_name}")
 
-            if poll_count == 1:
-                run_url = run.url or run_details.get("href", "")
-                if run_url:
-                    context.log.info(f"dbt Cloud run URL: {run_url}")
+                if poll_count == 1:
+                    run_url = run.url or run_details.get("href", "")
+                    if run_url:
+                        context.log.info(f"dbt Cloud run URL: {run_url}")
 
-            # 2. Try to activate debug log parsing
-            if not log_parsing_available:
-                run_steps = run_details.get("run_steps", [])
-                if run_steps:
-                    latest_step = max(run_steps, key=lambda s: s.get("index", 0))
-                    test_logs = self._fetch_step_debug_logs(latest_step["id"])
-                    if test_logs:
-                        log_parsing_available = True
-                        context.log.info("Per-model log streaming active.")
+                # 2. Try to activate debug log parsing
+                if not log_parsing_available:
+                    run_steps = run_details.get("run_steps", [])
+                    if run_steps:
+                        latest_step = max(run_steps, key=lambda s: s.get("index", 0))
+                        test_logs = self._fetch_step_debug_logs(latest_step["id"])
+                        if test_logs:
+                            log_parsing_available = True
+                            context.log.info("Per-model log streaming active.")
 
-            # 3. Parse debug logs and YIELD events for completed models
-            if log_parsing_available:
-                yield from self._stream_from_debug_logs(
-                    run_details, context, manifest, dagster_dbt_translator,
-                    log_name_to_unique_id,
-                )
+                # 3. Parse debug logs and YIELD events for completed models
+                if log_parsing_available:
+                    yield from self._stream_from_debug_logs(
+                        run_details, context, manifest, dagster_dbt_translator,
+                        log_name_to_unique_id,
+                    )
 
-            # 4. Fail fast?
-            if self.fail_fast and self._failures:
-                failed = ", ".join(self._failures)
-                context.log.error(
-                    f"Fail-fast triggered. Cancelling dbt Cloud run {self.run_id}. "
-                    f"Failed: {failed}"
-                )
-                self.cancel_run(context)
-                # Yield remaining from artifacts if available
-                yield from self._stream_remaining_from_artifacts(
-                    context, manifest, dagster_dbt_translator
-                )
-                raise Failure(
-                    f"dbt Cloud run '{self.run_id}' cancelled — failures: {failed}",
-                    metadata={"run_id": MetadataValue.int(self.run_id)},
-                )
-
-            # 5. Terminal state?
-            if run.status in TERMINAL_STATUSES:
-                # Final yield from run_results.json for tests + missed models
-                yield from self._stream_remaining_from_artifacts(
-                    context, manifest, dagster_dbt_translator
-                )
-
-                if run.status in {DbtCloudJobRunStatusType.ERROR, DbtCloudJobRunStatusType.CANCELLED}:
-                    failed = ", ".join(self._failures) if self._failures else "see dbt Cloud logs"
+                # 4. Fail fast?
+                if self.fail_fast and self._failures:
+                    failed = ", ".join(self._failures)
+                    context.log.error(
+                        f"Fail-fast triggered. Cancelling dbt Cloud run {self.run_id}. "
+                        f"Failed: {failed}"
+                    )
+                    self.cancel_run(context)
+                    run_completed = True
+                    # Yield remaining from artifacts if available
+                    yield from self._stream_remaining_from_artifacts(
+                        context, manifest, dagster_dbt_translator
+                    )
                     raise Failure(
-                        f"dbt Cloud run '{self.run_id}' finished with {status_name}. "
-                        f"Failures: {failed}",
+                        f"dbt Cloud run '{self.run_id}' cancelled — failures: {failed}",
                         metadata={"run_id": MetadataValue.int(self.run_id)},
                     )
-                return
 
-            time.sleep(self.poll_interval)
+                # 5. Terminal state?
+                if run.status in TERMINAL_STATUSES:
+                    run_completed = True
+                    # Final yield from run_results.json for tests + missed models
+                    yield from self._stream_remaining_from_artifacts(
+                        context, manifest, dagster_dbt_translator
+                    )
+
+                    if run.status in {DbtCloudJobRunStatusType.ERROR, DbtCloudJobRunStatusType.CANCELLED}:
+                        failed = ", ".join(self._failures) if self._failures else "see dbt Cloud logs"
+                        raise Failure(
+                            f"dbt Cloud run '{self.run_id}' finished with {status_name}. "
+                            f"Failures: {failed}",
+                            metadata={"run_id": MetadataValue.int(self.run_id)},
+                        )
+                    return
+
+                time.sleep(self.poll_interval)
+        finally:
+            if not run_completed:
+                context.log.warning(
+                    f"Dagster run terminated. Cancelling dbt Cloud run {self.run_id}."
+                )
+                self.cancel_run(context)
 
     # -- Streaming from debug logs ------------------------------------------
 
