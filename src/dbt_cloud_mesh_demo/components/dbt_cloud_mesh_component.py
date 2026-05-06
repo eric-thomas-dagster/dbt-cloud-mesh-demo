@@ -751,8 +751,29 @@ class DbtCloudMeshComponent(DbtCloudComponent):
                 if run.url:
                     context.log.info(f"dbt Cloud run URL: {run.url}")
 
-                # Poll for completion
-                client.poll_run(run.id)
+                # Poll for completion — cancel on Dagster run termination
+                import requests as req
+
+                run_completed = False
+                try:
+                    client.poll_run(run.id)
+                    run_completed = True
+                finally:
+                    if not run_completed:
+                        context.log.warning(
+                            f"Dagster run terminated. Cancelling dbt Cloud run {run.id}."
+                        )
+                        try:
+                            req.post(
+                                f"{client.api_v2_url}/runs/{run.id}/cancel/",
+                                headers={
+                                    "Authorization": f"Token {client.token}",
+                                    "Content-Type": "application/json",
+                                },
+                                timeout=client.request_timeout,
+                            )
+                        except Exception:
+                            pass
 
                 metadata: dict[str, Any] = {"dbt_cloud/run_id": run.id, "dbt_cloud/job_id": job_id}
                 if run.url:
