@@ -25,7 +25,7 @@ from dagster_dbt import DagsterDbtTranslator, DbtCloudComponent
 from dagster_dbt.asset_utils import build_dbt_specs, get_node, get_upstream_unique_ids
 from dagster_dbt.cloud_v2.resources import DbtCloudWorkspace
 from dagster_dbt.cloud_v2.run_handler import DbtCloudJobRunResults
-from dagster_dbt.cloud_v2.types import DbtCloudRun
+from dagster_dbt.cloud_v2.types import DbtCloudJobRunStatusType, DbtCloudRun
 from dagster_dbt.compat import REFABLE_NODE_TYPES, NodeStatus
 from dagster_shared.serdes import deserialize_value, serialize_value
 from pydantic import Field
@@ -183,12 +183,41 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         ),
     ] = 5.0
 
+    materialize_views: Annotated[
+        bool,
+        Resolver.default(
+            description=(
+                "Whether dbt view models should be materializable. When false, "
+                "views are treated as virtual assets — they appear in the lineage "
+                "graph but are never materialized, saving compute. Since a view "
+                "always reflects the current state of its upstream data, there is "
+                "nothing to refresh. Default true (all models materializable)."
+            ),
+        ),
+    ] = True
+
+    asset_granularity: Annotated[
+        Literal["model", "job"],
+        Resolver.default(
+            description=(
+                "'model': Each dbt model is a separate Dagster asset with full "
+                "lineage (default). "
+                "'job': The entire dbt Cloud workspace is a single Dagster asset, "
+                "like how Fivetran/Airbyte connectors appear as one asset. "
+                "Internal model lineage stays in dbt Cloud. Simpler for teams "
+                "that don't need per-model orchestration in Dagster."
+            ),
+        ),
+    ] = "model"
+
     @cached_property
     def translator(self) -> DagsterDbtTranslator:
         from dataclasses import replace
 
         settings = replace(
-            self.translation_settings, enable_code_references=False
+            self.translation_settings,
+            enable_code_references=False,
+            enable_dbt_views_as_virtual_assets=not self.materialize_views,
         )
         if self.group_overrides or self.key_prefix:
             return _MeshAwareTranslator(
@@ -564,6 +593,10 @@ class DbtCloudMeshComponent(DbtCloudComponent):
     def build_defs_from_state(
         self, context: dg.ComponentLoadContext, state_path: Path | None
     ) -> dg.Definitions:
+        # Job-level granularity: one asset per workspace, no per-model lineage
+        if self.asset_granularity == "job":
+            return self._build_job_level_defs(state_path)
+
         base_defs = super().build_defs_from_state(context, state_path)
 
         excluded_packages = self._get_excluded_package_names()
@@ -618,6 +651,171 @@ class DbtCloudMeshComponent(DbtCloudComponent):
             return self._apply_run_monitoring(final_defs)
 
         return final_defs
+
+    def _build_job_level_defs(self, state_path: Path | None) -> dg.Definitions:
+        """Build definitions with one asset per dbt Cloud job.
+
+        Like Fivetran/Airbyte connectors, each dbt Cloud job is represented as
+        a single Dagster asset instead of per-model assets. Internal model
+        lineage stays in dbt Cloud. Jobs can be materialized (orchestrate)
+        or observed (observe mode).
+        """
+        workspace = self.workspace
+        prefix = self.key_prefix or []
+        group_name = next(iter(self.group_overrides.values()), "dbt_cloud") if self.group_overrides else "dbt_cloud"
+
+        # Get jobs from workspace data or API
+        workspace_data = workspace.get_or_fetch_workspace_data()
+        jobs = workspace_data.jobs or []
+
+        # Filter out the adhoc job Dagster creates
+        adhoc_job_id = workspace_data.adhoc_job_id
+        user_jobs = [j for j in jobs if j.get("id") != adhoc_job_id]
+
+        if not user_jobs:
+            # No user-defined jobs — create a single asset for the workspace
+            user_jobs = [{"id": adhoc_job_id, "name": "dbt_build"}]
+
+        job_specs: list[dg.AssetSpec] = []
+        job_id_by_key: dict[str, int] = {}
+
+        for job in user_jobs:
+            job_id = job.get("id")
+            job_name = job.get("name", f"job_{job_id}")
+            safe_name = job_name.lower().replace(" ", "_").replace("-", "_")
+            asset_key = dg.AssetKey([*prefix, safe_name])
+
+            job_specs.append(dg.AssetSpec(
+                key=asset_key,
+                group_name=group_name,
+                description=job.get("description", f"dbt Cloud job: {job_name}"),
+                metadata={
+                    "dbt_cloud/job_id": job_id,
+                    "dbt_cloud/job_name": job_name,
+                    "dbt_cloud/project_id": workspace.project_id,
+                    "dbt_cloud/environment_id": workspace.environment_id,
+                },
+                kinds={"dbt_cloud"},
+            ))
+            job_id_by_key[str(asset_key)] = job_id
+
+        if self.mode == "observe":
+            sensors = [self._build_job_level_sensor(workspace, job_id_by_key)]
+            return dg.Definitions(assets=job_specs, sensors=sensors)
+
+        # Orchestrate mode: materializable assets that trigger dbt Cloud jobs
+        translator = self.translator
+
+        @dg.multi_asset(
+            specs=job_specs,
+            can_subset=True,
+            name=self._get_op_spec(f"dbt_cloud_jobs_{workspace.project_id}").name,
+        )
+        def _dbt_cloud_job_assets(context: dg.AssetExecutionContext):
+            for key in context.selected_asset_keys:
+                job_id = job_id_by_key.get(str(key))
+                if not job_id:
+                    continue
+
+                client = workspace.get_client()
+                run_details = client.trigger_job_run(job_id)
+                run = DbtCloudRun.from_run_details(run_details)
+                context.log.info(f"Triggered dbt Cloud job {job_id}, run {run.id}")
+                if run.url:
+                    context.log.info(f"dbt Cloud run URL: {run.url}")
+
+                # Poll for completion
+                client.poll_run(run.id)
+
+                metadata: dict[str, Any] = {"dbt_cloud/run_id": run.id, "dbt_cloud/job_id": job_id}
+                if run.url:
+                    metadata["run_url"] = dg.MetadataValue.url(run.url)
+
+                yield dg.Output(
+                    value=None,
+                    output_name=key.to_python_identifier(),
+                    metadata=metadata,
+                )
+
+        sensors = []
+        if self.create_sensor:
+            sensors.append(self._build_job_level_sensor(workspace, job_id_by_key))
+
+        return dg.Definitions(assets=[_dbt_cloud_job_assets], sensors=sensors)
+
+    def _build_job_level_sensor(
+        self, workspace: DbtCloudWorkspace, job_id_by_key: dict[str, int]
+    ) -> dg.SensorDefinition:
+        """Sensor that emits one materialization + check evaluation per completed job run."""
+        prefix = "_".join(self.key_prefix) + "_" if self.key_prefix else ""
+
+        # Reverse lookup: job_id → asset_key
+        key_by_job_id: dict[int, dg.AssetKey] = {
+            v: dg.AssetKey.from_user_string(k) for k, v in job_id_by_key.items()
+        }
+
+        @dg.sensor(
+            name=f"{prefix}jobs_{workspace.project_id}_{workspace.environment_id}_sensor",
+            description=f"Observes dbt Cloud job completions for project {workspace.project_id}",
+            minimum_interval_seconds=30,
+            default_status=dg.DefaultSensorStatus.RUNNING,
+        )
+        def _job_sensor(context: dg.SensorEvaluationContext) -> dg.SensorResult:
+            from dagster._time import datetime_from_timestamp, get_current_datetime
+
+            cursor_timestamp = float(context.cursor) if context.cursor else None
+            current_time = get_current_datetime()
+            lower_bound = cursor_timestamp or (current_time - timedelta(seconds=60)).timestamp()
+            upper_bound = current_time.timestamp()
+
+            client = workspace.get_client()
+            workspace_data = workspace.get_or_fetch_workspace_data()
+
+            runs, _total = client.get_runs_batch(
+                project_id=workspace.project_id,
+                environment_id=workspace.environment_id,
+                finished_at_lower_bound=datetime_from_timestamp(lower_bound),
+                finished_at_upper_bound=datetime_from_timestamp(upper_bound),
+                offset=0,
+            )
+
+            events: list[dg.AssetMaterialization | dg.AssetCheckEvaluation] = []
+            for run_details in runs:
+                run = DbtCloudRun.from_run_details(run_details)
+                if run.job_definition_id == workspace_data.adhoc_job_id:
+                    continue
+
+                asset_key = key_by_job_id.get(run.job_definition_id)
+                if not asset_key:
+                    continue
+
+                is_success = run.status == DbtCloudJobRunStatusType.SUCCESS
+                metadata: dict[str, Any] = {
+                    "dbt_cloud/run_id": run.id,
+                    "dbt_cloud/job_id": run.job_definition_id,
+                }
+                if run.url:
+                    metadata["run_url"] = dg.MetadataValue.url(run.url)
+
+                if is_success:
+                    events.append(
+                        dg.AssetMaterialization(asset_key=asset_key, metadata=metadata)
+                    )
+
+                events.append(
+                    dg.AssetCheckEvaluation(
+                        asset_key=asset_key,
+                        check_name="dbt_cloud_run_status",
+                        passed=is_success,
+                        metadata={**metadata, "status": run.status.name if run.status else "UNKNOWN"},
+                        severity=dg.AssetCheckSeverity.ERROR,
+                    )
+                )
+
+            context.update_cursor(str(upper_bound))
+            return dg.SensorResult(asset_events=events)
+
+        return _job_sensor
 
     def _apply_run_monitoring(
         self, defs: dg.Definitions
