@@ -197,20 +197,18 @@ class DbtCloudMeshComponent(DbtCloudComponent):
     ] = True
 
     skip_view_builds: Annotated[
-        str | None,
+        bool,
         Resolver.default(
             description=(
-                "Name of a dbt selector that skips building view models but still "
-                "runs their tests. Set to the selector name defined in your "
-                "selectors.yml (e.g. 'skip_views_but_test_views'). Unlike "
-                "materialize_views=false (which makes views virtual and skips "
-                "everything including tests), this keeps views as regular assets "
-                "but uses the selector to exclude view builds while keeping test "
-                "execution. See: https://docs.getdbt.com/docs/platform/billing#exclude-views-while-running-tests"
+                "Skip building view models but still run their tests. Views are "
+                "cheap (just CREATE VIEW) but on some platforms they count as "
+                "billable model builds. When enabled, Dagster automatically "
+                "rewrites the dbt selection so views are selected as test-only "
+                "(model_name,resource_type:test) while non-views build normally. "
+                "Preserves DAG ordering and test execution for all models."
             ),
-            examples=["skip_views_but_test_views"],
         ),
-    ] = None
+    ] = False
 
     asset_granularity: Annotated[
         Literal["model", "job"],
@@ -261,18 +259,59 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         return DagsterDbtTranslator(settings)
 
     def get_cli_args(self, context: dg.AssetExecutionContext) -> list[str]:
-        """Override to inject selector when skip_view_builds is configured.
+        """Override to rewrite selection when skip_view_builds is enabled.
 
-        Uses a dbt selector that excludes view builds but keeps test execution.
-        Requires a selectors.yml in the dbt project with the named selector.
-        See: https://docs.getdbt.com/docs/platform/billing#exclude-views-while-running-tests
+        For each selected asset that is a view, rewrites the selection from
+        'model_name' to 'model_name,resource_type:test' — so dbt runs tests
+        for the view but doesn't rebuild it. Non-view models are selected
+        normally. Multiple --select flags create a union in dbt.
+
+        Example: selecting customers (table), stg_customers (view), stg_orders (view)
+        becomes: --select customers --select stg_customers,resource_type:test --select stg_orders,resource_type:test
         """
+        if not self.skip_view_builds:
+            return super().get_cli_args(context)
+
         args = super().get_cli_args(context)
 
-        if self.skip_view_builds:
-            args.extend(["--selector", self.skip_view_builds])
+        # Get the manifest to check which models are views
+        workspace_data = self.workspace.get_or_fetch_workspace_data()
+        manifest = workspace_data.manifest
+        view_names: set[str] = set()
+        for node_id, node in manifest.get("nodes", {}).items():
+            if node.get("config", {}).get("materialized") == "view":
+                view_names.add(node.get("name", ""))
 
-        return args
+        if not view_names:
+            return args
+
+        # Rewrite --select args: for views, append ,resource_type:test
+        rewritten: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--select" and i + 1 < len(args):
+                select_value = args[i + 1]
+                # Selection might contain multiple space-separated models
+                models = select_value.split()
+                new_selects: list[str] = []
+                for model in models:
+                    # Strip any dbt graph operators (+, @) to check the name
+                    clean_name = model.lstrip("+@").rstrip("+")
+                    # Also handle fqn-style names (project.folder.model)
+                    short_name = clean_name.split(".")[-1] if "." in clean_name else clean_name
+                    if short_name in view_names:
+                        new_selects.append(f"{model},resource_type:test")
+                    else:
+                        new_selects.append(model)
+                # Each model gets its own --select for proper union behavior
+                for sel in new_selects:
+                    rewritten.extend(["--select", sel])
+                i += 2
+            else:
+                rewritten.append(args[i])
+                i += 1
+
+        return rewritten
 
     def _get_excluded_package_names(self) -> set[str]:
         """Derive excluded package names from the `exclude` attribute and `external_packages`.
