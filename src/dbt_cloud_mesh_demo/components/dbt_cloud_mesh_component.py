@@ -196,6 +196,22 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         ),
     ] = True
 
+    skip_view_builds: Annotated[
+        str | None,
+        Resolver.default(
+            description=(
+                "Name of a dbt selector that skips building view models but still "
+                "runs their tests. Set to the selector name defined in your "
+                "selectors.yml (e.g. 'skip_views_but_test_views'). Unlike "
+                "materialize_views=false (which makes views virtual and skips "
+                "everything including tests), this keeps views as regular assets "
+                "but uses the selector to exclude view builds while keeping test "
+                "execution. See: https://docs.getdbt.com/docs/platform/billing#exclude-views-while-running-tests"
+            ),
+            examples=["skip_views_but_test_views"],
+        ),
+    ] = None
+
     asset_granularity: Annotated[
         Literal["model", "job"],
         Resolver.default(
@@ -243,6 +259,20 @@ class DbtCloudMeshComponent(DbtCloudComponent):
                 settings=settings,
             )
         return DagsterDbtTranslator(settings)
+
+    def get_cli_args(self, context: dg.AssetExecutionContext) -> list[str]:
+        """Override to inject selector when skip_view_builds is configured.
+
+        Uses a dbt selector that excludes view builds but keeps test execution.
+        Requires a selectors.yml in the dbt project with the named selector.
+        See: https://docs.getdbt.com/docs/platform/billing#exclude-views-while-running-tests
+        """
+        args = super().get_cli_args(context)
+
+        if self.skip_view_builds:
+            args.extend(["--selector", self.skip_view_builds])
+
+        return args
 
     def _get_excluded_package_names(self) -> set[str]:
         """Derive excluded package names from the `exclude` attribute and `external_packages`.
@@ -907,9 +937,12 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         def _monitored_dbt_cloud_assets(
             context: dg.AssetExecutionContext,
         ):
-            # workspace.cli() handles subset selection and triggers the run
+            # workspace.cli() handles subset selection and triggers the run.
+            # When skip_view_builds is enabled, exclude views from build but
+            # keep tests running via --exclude and --resource-type flags.
+            cli_args = self.get_cli_args(context) if hasattr(self, 'get_cli_args') else ["build"]
             invocation = workspace.cli(
-                ["build"],
+                cli_args,
                 dagster_dbt_translator=translator,
                 context=context,
             )
