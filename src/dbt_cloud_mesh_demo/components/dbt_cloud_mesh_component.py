@@ -248,7 +248,9 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         settings = replace(
             self.translation_settings,
             enable_code_references=False,
-            enable_dbt_views_as_virtual_assets=not self.materialize_views,
+            enable_dbt_views_as_virtual_assets=(
+                not self.materialize_views or self.skip_view_builds
+            ),
         )
         if self.group_overrides or self.key_prefix:
             return _MeshAwareTranslator(
