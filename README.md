@@ -89,6 +89,34 @@ attributes:
 
 Virtual view assets appear in the lineage graph but are never materialized. Dagster skips them during execution and resolves dependencies through them to the next non-virtual ancestor. This saves compute without losing visibility.
 
+Note: virtual views also skip test execution. If you need tests to run on views, use `skip_view_builds` instead.
+
+### Skip view builds but keep tests (skip_view_builds)
+
+On some platforms, view creation counts as a billable model build even though views don't persist data. `skip_view_builds: true` skips building views but still runs their tests — saving compute while maintaining data quality.
+
+```yaml
+attributes:
+  skip_view_builds: true
+```
+
+How it works: when Dagster selects assets to materialize, the component reads the manifest to identify views and rewrites the dbt selection. Non-view models are selected normally. Views are selected as test-only using dbt's intersection syntax (`model_name,resource_type:test`). dbt runs in DAG order — builds non-views, tests everything.
+
+After the dbt run completes, the component yields `Output` events for view assets (since the views exist in the warehouse from prior builds and their tests passed), so they show as materialized (green) in the Dagster UI.
+
+**Runtime override**: when `skip_view_builds` is enabled, a `build_views` checkbox appears in the Dagster launchpad. Check it to force a full build including views for that specific run (e.g. after schema changes or new view creation). Subsequent runs resume skipping views.
+
+**Comparison**:
+
+| | `materialize_views: false` | `skip_view_builds: true` |
+|---|---|---|
+| Views in asset graph | Virtual (non-materializable) | Regular (materializable) |
+| View SQL executed | Never | Skipped (unless `build_views` override) |
+| View tests run | No | **Yes** |
+| Views show as green | Always (virtual = always fresh) | Yes (Output yielded after tests pass) |
+| Subset materialization | Views excluded from selection | Works — views get test-only selection |
+| Runtime override | No | Yes (`build_views` in launchpad) |
+
 ### Job-level assets (asset_granularity)
 
 Instead of exposing every dbt model as a Dagster asset, treat each dbt Cloud job as a single asset — like how Fivetran or Airbyte connectors appear as one asset. Internal model lineage stays in dbt Cloud.
