@@ -248,9 +248,7 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         settings = replace(
             self.translation_settings,
             enable_code_references=False,
-            enable_dbt_views_as_virtual_assets=(
-                not self.materialize_views or self.skip_view_builds
-            ),
+            enable_dbt_views_as_virtual_assets=not self.materialize_views,
         )
         if self.group_overrides or self.key_prefix:
             return _MeshAwareTranslator(
@@ -968,6 +966,7 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         translator = self.translator
         poll_interval = self.poll_interval
         fail_fast = self.fail_fast
+        skip_view_builds = self.skip_view_builds
 
         @dg.multi_asset(
             specs=list(original.specs),
@@ -1006,6 +1005,33 @@ class DbtCloudMeshComponent(DbtCloudComponent):
                 manifest=invocation.manifest,
                 dagster_dbt_translator=invocation.dagster_dbt_translator,
             )
+
+            # When skip_view_builds is enabled, yield Output for view assets
+            # that were selected but not built. The view exists in the warehouse
+            # (from a prior build) and its tests passed — record the
+            # materialization so it shows as green in Dagster.
+            if skip_view_builds:
+                manifest_data = invocation.manifest
+                yielded = monitor._yielded_output_names
+                for key in context.selected_asset_keys:
+                    output_name = key.to_python_identifier()
+                    if output_name in yielded:
+                        continue
+                    # Check if this asset is a view
+                    for node_id, node in manifest_data.get("nodes", {}).items():
+                        if node.get("config", {}).get("materialized") == "view":
+                            node_key = translator.get_asset_key(node)
+                            if node_key == key:
+                                context.log.info(
+                                    f"Recording materialization for view {key} "
+                                    f"(build skipped, tests ran)"
+                                )
+                                yield dg.Output(
+                                    value=None,
+                                    output_name=output_name,
+                                    metadata={"build_skipped": True, "reason": "view"},
+                                )
+                                break
 
         return _monitored_dbt_cloud_assets
 
