@@ -69,6 +69,22 @@ class _MeshAwareTranslator(DagsterDbtTranslator):
         return super().get_group_name(dbt_resource_props)
 
 
+class DbtCloudMeshRunConfig(dg.Config):
+    """Runtime config for dbt Cloud mesh component runs.
+
+    Configurable per-run in the Dagster UI launchpad.
+    """
+
+    build_views: bool = dg.Field(
+        default=False,
+        description=(
+            "Build view models in this run. When skip_view_builds is enabled "
+            "on the component, views are normally skipped. Check this to force "
+            "a full build including views (e.g. after schema changes)."
+        ),
+    )
+
+
 class DbtCloudMeshComponent(DbtCloudComponent):
     """A DbtCloudComponent that preserves cross-project lineage for dbt mesh.
 
@@ -241,6 +257,12 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         ),
     ] = Field(default_factory=dict)
 
+    @property
+    def op_config_schema(self) -> type[dg.Config] | None:
+        if self.skip_view_builds:
+            return DbtCloudMeshRunConfig
+        return None
+
     @cached_property
     def translator(self) -> DagsterDbtTranslator:
         from dataclasses import replace
@@ -271,6 +293,12 @@ class DbtCloudMeshComponent(DbtCloudComponent):
         """
         if not self.skip_view_builds:
             return super().get_cli_args(context)
+
+        # Check runtime config — if build_views is True, skip the rewrite
+        # and build everything normally (full build including views)
+        if context.op_config and isinstance(context.op_config, DbtCloudMeshRunConfig):
+            if context.op_config.build_views:
+                return super().get_cli_args(context)
 
         args = super().get_cli_args(context)
 
@@ -1006,11 +1034,18 @@ class DbtCloudMeshComponent(DbtCloudComponent):
                 dagster_dbt_translator=invocation.dagster_dbt_translator,
             )
 
-            # When skip_view_builds is enabled, yield Output for view assets
-            # that were selected but not built. The view exists in the warehouse
-            # (from a prior build) and its tests passed — record the
+            # When skip_view_builds is enabled (and build_views not overridden),
+            # yield Output for view assets that were selected but not built.
+            # The view exists in the warehouse (from a prior build) and its
+            # tests passed — record the
             # materialization so it shows as green in Dagster.
-            if skip_view_builds:
+            # Check if build_views was overridden at runtime
+            build_views_override = (
+                context.op_config.build_views
+                if context.op_config and isinstance(context.op_config, DbtCloudMeshRunConfig)
+                else False
+            )
+            if skip_view_builds and not build_views_override:
                 manifest_data = invocation.manifest
                 yielded = monitor._yielded_output_names
                 for key in context.selected_asset_keys:
